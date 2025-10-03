@@ -29,10 +29,6 @@ if 'FINMIND_API_TOKEN' in st.secrets:
 else:
     st.warning("在 Streamlit secrets 中找不到 FinMind API token。部分圖表可能無法生成。")
 
-# 【移除】不再需要 'static' 資料夾
-# if not os.path.exists('static'):
-#     os.makedirs('static')
-
 # --------------------------------------------------------------------------------
 # 輔助函式
 # --------------------------------------------------------------------------------
@@ -75,7 +71,6 @@ def process_ranking_analysis(stock_df):
                 if pd.notna(estimated_volume_lots) and pd.notna(avg_vol_5_lots) and avg_vol_5_lots > 0 and estimated_volume_lots > (2 * avg_vol_5_lots):
                     st.write(f"  -> ✅ **符合條件**: {stock_id}")
                     result_item['error'] = None
-                    # 【修改】儲存圖表物件而非路徑
                     result_item['chart_figure'] = analysis_result['chart_figure']
                     result_item['indicators'] = indicators
                     result_item['estimated_volume_lots'] = estimated_volume_lots
@@ -146,7 +141,6 @@ if 'action' in st.session_state:
                         with st.spinner(f"正在為 {stock_name} 生成圖表..."):
                             analysis_result = analyze_stock(stock_code)
                             if analysis_result['status'] == 'success':
-                                # 【修改】直接顯示 Plotly 圖表
                                 st.plotly_chart(analysis_result['chart_figure'], use_container_width=True)
                             else:
                                 st.error(f"為 {stock_name} 生成圖表時出錯: {analysis_result.get('message', '未知錯誤')}")
@@ -159,11 +153,35 @@ if 'action' in st.session_state:
         st.header("⭐ 我的選股 結果 (from Goodinfo)")
         with st.spinner("正在從 Goodinfo! 網站爬取資料..."):
             scraped_df = scrape_goodinfo()
-            if scraped_df is not None and not scraped_df.empty:
-                st.success(f"成功爬取到 {len(scraped_df)} 筆資料。")
-                st.dataframe(scraped_df)
-            else:
-                st.warning("未爬取到任何資料。")
+        
+        if scraped_df is not None and not scraped_df.empty:
+            st.success(f"成功爬取到 {len(scraped_df)} 筆資料。")
+            st.dataframe(scraped_df)
+            
+            for _, stock in scraped_df.iterrows():
+                try:
+                    stock_code = str(stock['代碼']).strip()
+                    stock_name = str(stock['名稱']).strip()
+                    
+                    if not stock_code or stock_code == 'nan':
+                        continue
+
+                    st.subheader(f"技術分析圖: {stock_name} ({stock_code})")
+                    with st.spinner(f"正在為 {stock_name} ({stock_code}) 生成圖表..."):
+                        analysis_result = analyze_stock(stock_code)
+                        if analysis_result['status'] == 'success':
+                            st.plotly_chart(analysis_result['chart_figure'], use_container_width=True)
+                        else:
+                            st.error(f"為 {stock_name} ({stock_code}) 生成圖表時出錯: {analysis_result.get('message', '未知錯誤')}")
+                except KeyError as e:
+                    st.error(f"處理資料時發生錯誤：找不到欄位 {e}。請檢查 'scraper.py' 的欄位名稱是否正確。")
+                    break
+                except Exception as e:
+                    st.error(f"處理股票 {stock.get('代號', 'N/A')} 時發生未知錯誤: {e}")
+                    continue
+
+        else:
+            st.warning("未爬取到任何資料。")
 
     elif action in ["rank_listed", "rank_otc"]:
         market_type = "上市" if action == "rank_listed" else "上櫃"
@@ -187,7 +205,6 @@ if 'action' in st.session_state:
             st.subheader("個股分析圖表")
             for result in yahoo_results:
                 st.subheader(f"{result['stock_info']['Stock Name']} ({result['stock_info']['Stock Symbol']})")
-                # 【修改】直接顯示 Plotly 圖表
                 st.plotly_chart(result['chart_figure'], use_container_width=True)
 
     elif action == "single_stock_analysis":
@@ -207,7 +224,6 @@ if 'action' in st.session_state:
             with st.spinner("正在生成技術分析圖..."):
                 tech_analysis_result = analyze_stock(stock_code)
                 if tech_analysis_result['status'] == 'success':
-                    # 【修改】直接顯示 Plotly 圖表
                     st.plotly_chart(tech_analysis_result['chart_figure'], use_container_width=True)
                 else:
                     st.error(f"無法生成技術分析圖: {tech_analysis_result.get('message', '未知錯誤')}")
@@ -215,7 +231,6 @@ if 'action' in st.session_state:
             # 2. 月營收趨勢圖
             st.subheader("月營收趨勢圖")
             with st.spinner("正在生成月營收趨勢圖..."):
-                # 【修改】接收圖表物件和錯誤
                 revenue_fig, revenue_error = plot_stock_revenue_trend(stock_code)
                 if not revenue_error:
                     st.plotly_chart(revenue_fig, use_container_width=True)
@@ -225,7 +240,6 @@ if 'action' in st.session_state:
             # 3. 大戶股權變化圖
             st.subheader("大戶股權變化圖")
             with st.spinner("正在生成大戶股權變化圖..."):
-                # 【修改】接收圖表物件和錯誤
                 shareholder_fig, shareholder_error = plot_stock_major_shareholders(stock_code)
                 if not shareholder_error:
                     st.plotly_chart(shareholder_fig, use_container_width=True)
