@@ -3,6 +3,7 @@ import pandas as pd
 import os
 from datetime import datetime
 import twstock
+import numpy as np # 為了處理 np.isnan
 
 # --- 導入所有必要的模組 ---
 try:
@@ -59,7 +60,8 @@ def process_ranking_analysis(stock_df):
             if not stock_id or stock_id == '0':
                 continue
 
-            st.write(f"正在分析： {stock_id} {stock_info.get('Stock Name')}...")
+            # 移除 st.write 減少畫面雜訊
+            # st.write(f"正在分析： {stock_id} {stock_info.get('Stock Name')}...")
             analysis_result = analyze_stock(stock_id)
             result_item = {'stock_info': stock_info}
 
@@ -69,17 +71,21 @@ def process_ranking_analysis(stock_df):
                 estimated_volume_lots = stock_info.get('Estimated Volume', 0)
 
                 if pd.notna(estimated_volume_lots) and pd.notna(avg_vol_5_lots) and avg_vol_5_lots > 0 and estimated_volume_lots > (2 * avg_vol_5_lots):
-                    st.write(f"  -> ✅ **符合條件**: {stock_id}")
+                    # st.write(f"  -> ✅ **符合條件**: {stock_id}")
                     result_item['error'] = None
                     result_item['chart_figure'] = analysis_result['chart_figure']
                     result_item['indicators'] = indicators
                     result_item['estimated_volume_lots'] = estimated_volume_lots
                     result_item['avg_vol_5_lots'] = avg_vol_5_lots
                     results_list.append(result_item)
-                else:
-                    st.write(f"  -> ❌ **不符條件**: {stock_id} - 預估量未達標")
+                # else:
+                    # st.write(f"  -> ❌ **不符條件**: {stock_id} - 預估量未達標")
             else:
                 st.write(f"  -> ⚠️ **分析失敗**: {stock_id}: {analysis_result.get('message', '未知錯誤')}")
+                # 即使分析失敗，也加入列表以顯示錯誤訊息
+                result_item['error'] = analysis_result.get('message', '未知錯誤')
+                result_item['indicators'] = {}
+                results_list.append(result_item)
 
             progress_bar.progress((i + 1) / total_stocks)
         
@@ -96,6 +102,7 @@ def process_ranking_analysis(stock_df):
 # --------------------------------------------------------------------------------
 
 st.title("📈 台股互動分析儀")
+# --- 【修改】確保系統時間顯示在最上方 ---
 st.caption(f"系統時間: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 # --- 側邊欄 ---
@@ -124,6 +131,7 @@ if st.sidebar.button("生成個股分析圖"):
 if 'action' in st.session_state:
     action = st.session_state.action
 
+    # ... (其他 action 的程式碼維持不變) ...
     if action == "concentration_pick":
         st.header("📊 1日籌碼集中度選股結果")
         with st.spinner("正在獲取並篩選籌碼集中度資料..."):
@@ -183,29 +191,74 @@ if 'action' in st.session_state:
         else:
             st.warning("未爬取到任何資料。")
 
+
     elif action in ["rank_listed", "rank_otc"]:
         market_type = "上市" if action == "rank_listed" else "上櫃"
         st.header(f"🚀 漲幅排行榜 ({market_type})")
+        
+        # --- 【新增】顯示篩選條件 ---
+        st.info(
+            """
+            **篩選條件：**
+            1.  成交價 > 35元
+            2.  漲跌幅 > 2%
+            3.  預估成交量 > 2 * 前5日平均量
+            """
+        )
+        
         with st.spinner(f"正在爬取 Yahoo Finance ({market_type}) 的資料..."):
             url = "https://tw.stock.yahoo.com/rank/change-up?exchange=TAI" if action == "rank_listed" else "https://tw.stock.yahoo.com/rank/change-up?exchange=TWO"
             stock_df = scrape_yahoo_listed(url) if action == "rank_listed" else scrape_yahoo_otc(url)
         
         yahoo_results = process_ranking_analysis(stock_df)
+
+        # --- 【重大修改】建立新的 DataFrame 來顯示結果 ---
         if yahoo_results:
             st.subheader("篩選結果摘要")
-            summary_df = pd.DataFrame([{
-                "排名": res['stock_info'].get('Rank'), "代號": res['stock_info'].get('Stock Symbol'),
-                "名稱": res['stock_info'].get('Stock Name'), "成交價": res['stock_info'].get('Price'),
-                "漲跌幅(%)": res['stock_info'].get('Change Percent'), "預估成交量(張)": res.get('estimated_volume_lots'),
-                "5日均量(張)": res.get('avg_vol_5_lots'), "KD值": f"{res['indicators'].get('k'):.2f} / {res['indicators'].get('d'):.2f}",
-                "I值": f"{res['indicators'].get('i_value'):.0f}"
-            } for res in yahoo_results])
-            st.dataframe(summary_df.style.format({'成交價': '{:.2f}', '漲跌幅(%)': '{:.2f}', '預估成交量(張)': '{:.0f}', '5日均量(張)': '{:.0f}'}))
+            
+            display_data = []
+            for res in yahoo_results:
+                stock_info = res.get('stock_info', {})
+                indicators = res.get('indicators', {})
+                
+                # 檢查分析是否成功
+                if res.get('error'):
+                     k_d_val = "分析失敗"
+                     i_val = "分析失敗"
+                else:
+                    k_val = indicators.get('k')
+                    d_val = indicators.get('d')
+                    i_val_raw = indicators.get('i_value')
+                    
+                    k_d_val = f"{k_val:.2f} / {d_val:.2f}" if k_val is not None and not np.isnan(k_val) else "--"
+                    i_val = f"{i_val_raw:.0f}" if i_val_raw is not None and not np.isnan(i_val_raw) else "--"
+
+                display_data.append({
+                    "排名": stock_info.get('Rank'),
+                    "代號/名稱": f"{stock_info.get('Stock Symbol')}<br>{stock_info.get('Stock Name')}",
+                    "成交價": stock_info.get('Price'),
+                    "漲跌幅(%)": stock_info.get('Change Percent'),
+                    "今日成交量(張)": stock_info.get('Volume (Shares)'),
+                    "Factor": stock_info.get('Factor'),
+                    "預估成交量(張)": res.get('estimated_volume_lots'),
+                    "5日均量(張)": res.get('avg_vol_5_lots'),
+                    "前一日KD值": k_d_val,
+                    "前一日I值": i_val
+                })
+            
+            summary_df = pd.DataFrame(display_data)
+            
+            # 使用 st.markdown 解決換行和 HTML 格式問題
+            st.markdown(
+                summary_df.to_html(escape=False, index=False),
+                unsafe_allow_html=True
+            )
 
             st.subheader("個股分析圖表")
             for result in yahoo_results:
-                st.subheader(f"{result['stock_info']['Stock Name']} ({result['stock_info']['Stock Symbol']})")
-                st.plotly_chart(result['chart_figure'], use_container_width=True)
+                if not result.get('error'): # 只顯示分析成功的圖表
+                    st.subheader(f"{result['stock_info']['Stock Name']} ({result['stock_info']['Stock Symbol']})")
+                    st.plotly_chart(result['chart_figure'], use_container_width=True)
 
     elif action == "single_stock_analysis":
         stock_identifier = st.session_state.stock_id
