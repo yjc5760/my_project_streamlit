@@ -1,9 +1,9 @@
 import streamlit as st
 import pandas as pd
 import os
-from datetime import datetime
+from datetime import datetime, timedelta # 步驟1: 在這裡導入 timedelta
 import twstock
-import numpy as np # 為了處理 np.isnan
+import numpy as np 
 
 # --- 導入所有必要的模組 ---
 try:
@@ -11,7 +11,6 @@ try:
     from yahoo_stock import scrape_yahoo_stock_rankings as scrape_yahoo_listed
     from yahoo_stock_otc import scrape_yahoo_stock_rankings as scrape_yahoo_otc
     from stock_analyzer import analyze_stock
-    # 【修改】導入新的繪圖函式
     from stock_information_plot import plot_stock_revenue_trend, plot_stock_major_shareholders, get_stock_code
     from concentration_1day import fetch_stock_concentration_data, filter_stock_data
 
@@ -31,7 +30,7 @@ else:
     st.warning("在 Streamlit secrets 中找不到 FinMind API token。部分圖表可能無法生成。")
 
 # --------------------------------------------------------------------------------
-# 輔助函式
+# 輔助函式 (此區塊維持不變)
 # --------------------------------------------------------------------------------
 def process_ranking_analysis(stock_df):
     if stock_df is None or stock_df.empty:
@@ -40,7 +39,6 @@ def process_ranking_analysis(stock_df):
 
     results_list = []
     try:
-        # 資料清理與初步篩選
         for col in ['Price', 'Change Percent', 'Estimated Volume']:
             if col in stock_df.columns:
                 stock_df[col] = pd.to_numeric(stock_df[col], errors='coerce')
@@ -60,8 +58,6 @@ def process_ranking_analysis(stock_df):
             if not stock_id or stock_id == '0':
                 continue
 
-            # 移除 st.write 減少畫面雜訊
-            # st.write(f"正在分析： {stock_id} {stock_info.get('Stock Name')}...")
             analysis_result = analyze_stock(stock_id)
             result_item = {'stock_info': stock_info}
 
@@ -71,18 +67,14 @@ def process_ranking_analysis(stock_df):
                 estimated_volume_lots = stock_info.get('Estimated Volume', 0)
 
                 if pd.notna(estimated_volume_lots) and pd.notna(avg_vol_5_lots) and avg_vol_5_lots > 0 and estimated_volume_lots > (2 * avg_vol_5_lots):
-                    # st.write(f"  -> ✅ **符合條件**: {stock_id}")
                     result_item['error'] = None
                     result_item['chart_figure'] = analysis_result['chart_figure']
                     result_item['indicators'] = indicators
                     result_item['estimated_volume_lots'] = estimated_volume_lots
                     result_item['avg_vol_5_lots'] = avg_vol_5_lots
                     results_list.append(result_item)
-                # else:
-                    # st.write(f"  -> ❌ **不符條件**: {stock_id} - 預估量未達標")
             else:
                 st.write(f"  -> ⚠️ **分析失敗**: {stock_id}: {analysis_result.get('message', '未知錯誤')}")
-                # 即使分析失敗，也加入列表以顯示錯誤訊息
                 result_item['error'] = analysis_result.get('message', '未知錯誤')
                 result_item['indicators'] = {}
                 results_list.append(result_item)
@@ -102,10 +94,13 @@ def process_ranking_analysis(stock_df):
 # --------------------------------------------------------------------------------
 
 st.title("📈 台股互動分析儀")
-# --- 【修改】確保系統時間顯示在最上方 ---
-st.caption(f"系統時間: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-# --- 側邊欄 ---
+# --- 步驟2: 修改此行程式碼 ---
+taipei_time = datetime.now() + timedelta(hours=8)
+st.caption(f"台北時間: {taipei_time.strftime('%Y-%m-%d %H:%M:%S')}")
+
+
+# --- 側邊欄 (此區塊維持不變) ---
 st.sidebar.header("選股策略")
 if st.sidebar.button("1日籌碼集中度選股"):
     st.session_state.action = "concentration_pick"
@@ -127,11 +122,10 @@ if st.sidebar.button("生成個股分析圖"):
     else:
         st.sidebar.warning("請輸入股票代碼或名稱")
 
-# --- 主要內容區域 ---
+# --- 主要內容區域 (此區塊維持不變) ---
 if 'action' in st.session_state:
     action = st.session_state.action
 
-    # ... (其他 action 的程式碼維持不變) ...
     if action == "concentration_pick":
         st.header("📊 1日籌碼集中度選股結果")
         with st.spinner("正在獲取並篩選籌碼集中度資料..."):
@@ -196,7 +190,6 @@ if 'action' in st.session_state:
         market_type = "上市" if action == "rank_listed" else "上櫃"
         st.header(f"🚀 漲幅排行榜 ({market_type})")
         
-        # --- 【新增】顯示篩選條件 ---
         st.info(
             """
             **篩選條件：**
@@ -212,7 +205,6 @@ if 'action' in st.session_state:
         
         yahoo_results = process_ranking_analysis(stock_df)
 
-        # --- 【重大修改】建立新的 DataFrame 來顯示結果 ---
         if yahoo_results:
             st.subheader("篩選結果摘要")
             
@@ -221,7 +213,6 @@ if 'action' in st.session_state:
                 stock_info = res.get('stock_info', {})
                 indicators = res.get('indicators', {})
                 
-                # 檢查分析是否成功
                 if res.get('error'):
                      k_d_val = "分析失敗"
                      i_val = "分析失敗"
@@ -248,7 +239,6 @@ if 'action' in st.session_state:
             
             summary_df = pd.DataFrame(display_data)
             
-            # 使用 st.markdown 解決換行和 HTML 格式問題
             st.markdown(
                 summary_df.to_html(escape=False, index=False),
                 unsafe_allow_html=True
@@ -256,7 +246,7 @@ if 'action' in st.session_state:
 
             st.subheader("個股分析圖表")
             for result in yahoo_results:
-                if not result.get('error'): # 只顯示分析成功的圖表
+                if not result.get('error'):
                     st.subheader(f"{result['stock_info']['Stock Name']} ({result['stock_info']['Stock Symbol']})")
                     st.plotly_chart(result['chart_figure'], use_container_width=True)
 
@@ -272,7 +262,6 @@ if 'action' in st.session_state:
             stock_name = twstock.codes[stock_code].name
             st.subheader(f"{stock_name} ({stock_code})")
             
-            # 1. 技術分析圖
             st.subheader("技術分析圖")
             with st.spinner("正在生成技術分析圖..."):
                 tech_analysis_result = analyze_stock(stock_code)
@@ -281,7 +270,6 @@ if 'action' in st.session_state:
                 else:
                     st.error(f"無法生成技術分析圖: {tech_analysis_result.get('message', '未知錯誤')}")
             
-            # 2. 月營收趨勢圖
             st.subheader("月營收趨勢圖")
             with st.spinner("正在生成月營收趨勢圖..."):
                 revenue_fig, revenue_error = plot_stock_revenue_trend(stock_code)
@@ -290,7 +278,6 @@ if 'action' in st.session_state:
                 else:
                     st.error(f"無法生成營收圖: {revenue_error}")
             
-            # 3. 大戶股權變化圖
             st.subheader("大戶股權變化圖")
             with st.spinner("正在生成大戶股權變化圖..."):
                 shareholder_fig, shareholder_error = plot_stock_major_shareholders(stock_code)
