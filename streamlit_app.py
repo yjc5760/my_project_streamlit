@@ -1,6 +1,19 @@
 # streamlit_app.py (Optimized)
 
 import streamlit as st
+
+# --- 偵錯碼開始 ---
+st.header("偵錯資訊：檢查 Secrets")
+if 'goodinfo' in st.secrets and 'cookie' in st.secrets['goodinfo']:
+    st.success("✅ 成功讀取到 Goodinfo Cookie！")
+    # 為了安全，只顯示 Cookie 的一小部分
+    st.write("Cookie 前15個字元:", st.secrets['goodinfo']['cookie'][:15], "...")
+else:
+    st.error("❌ 讀取 Goodinfo Cookie 失敗！")
+    st.write("目前的 secrets 內容：")
+    st.json(st.secrets.to_dict()) # 顯示所有讀取到的 secrets
+# --- 偵錯碼結束 ---
+
 import pandas as pd
 import os
 from datetime import datetime, timedelta
