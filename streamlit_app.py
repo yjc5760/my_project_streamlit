@@ -1,17 +1,17 @@
-# streamlit_app.py (Optimized)
+# streamlit_app.py (完整修正版)
 
 import streamlit as st
 
 # --- 偵錯碼開始 ---
-st.header("偵錯資訊：檢查 Secrets")
-if 'goodinfo' in st.secrets and 'cookie' in st.secrets['goodinfo']:
-    st.success("✅ 成功讀取到 Goodinfo Cookie！")
-    # 為了安全，只顯示 Cookie 的一小部分
-    st.write("Cookie 前15個字元:", st.secrets['goodinfo']['cookie'][:15], "...")
-else:
-    st.error("❌ 讀取 Goodinfo Cookie 失敗！")
-    st.write("目前的 secrets 內容：")
-    st.json(st.secrets.to_dict()) # 顯示所有讀取到的 secrets
+# st.header("偵錯資訊：檢查 Secrets")
+# if 'goodinfo' in st.secrets and 'cookie' in st.secrets['goodinfo']:
+#     st.success("✅ 成功讀取到 Goodinfo Cookie！")
+#     # 為了安全，只顯示 Cookie 的一小部分
+#     st.write("Cookie 前15個字元:", st.secrets['goodinfo']['cookie'][:15], "...")
+# else:
+#     st.error("❌ 讀取 Goodinfo Cookie 失敗！")
+#     st.write("目前的 secrets 內容：")
+#     st.json(st.secrets.to_dict()) # 顯示所有讀取到的 secrets
 # --- 偵錯碼結束 ---
 
 import pandas as pd
@@ -197,7 +197,7 @@ def display_goodinfo_results():
 
 def display_ranking_results(market_type: str):
     st.header(f"🚀 漲幅排行榜 ({market_type})")
-    st.info("篩選條件：\n1. 成交價 > 35元\n2. 漲跌幅 > 2%\n3. 預估成交量 > 2 * 前5日平均量")
+    st.info("篩選條件：\n1. 成交價 > 35元\n2. 漲跌幅 > 2%\n3. 預估成交量 > 2 倍前5日均量")
     
     url = "https://tw.stock.yahoo.com/rank/change-up?exchange=TAI" if market_type == "上市" else "https://tw.stock.yahoo.com/rank/change-up?exchange=TWO"
     with st.spinner(f"正在爬取 Yahoo Finance ({market_type}) 的資料..."):
@@ -208,10 +208,45 @@ def display_ranking_results(market_type: str):
     if yahoo_results:
         st.subheader("篩選結果摘要")
         display_data = []
-        # ... (此部分摘要表格的邏輯與原版相同) ...
-        # ... (省略) ...
-        summary_df = pd.DataFrame(display_data)
-        st.markdown(summary_df.to_html(escape=False, index=False), unsafe_allow_html=True)
+        
+        # --- 【這就是新增的關鍵邏輯】 ---
+        for result in yahoo_results:
+            if not result.get('error'):
+                stock_info = result['stock_info']
+                indicators = result.get('indicators', {})
+                
+                # 格式化 KD 值，處理可能的 None
+                k_val = f"{indicators.get('k'):.2f}" if indicators.get('k') is not None else "N/A"
+                d_val = f"{indicators.get('d'):.2f}" if indicators.get('d') is not None else "N/A"
+                
+                # 格式化階梯訊號 I_value
+                i_val = indicators.get('i_value')
+                i_text = str(i_val) if i_val is not None else "N/A"
+                if i_val is not None:
+                    i_color = 'red' if i_val > 0 else 'green'
+                    i_text = f'<span style="color:{i_color};">{i_val}</span>'
+
+                display_data.append({
+                    "排名": stock_info.get('Rank', ''),
+                    "代碼": stock_info.get('Stock Symbol', ''),
+                    "名稱": stock_info.get('Stock Name', ''),
+                    "成交價": stock_info.get('Price', ''),
+                    "漲跌幅(%)": stock_info.get('Change Percent', ''),
+                    "預估量(張)": int(result.get('estimated_volume_lots', 0)),
+                    "5日均量(張)": int(result.get('avg_vol_5_lots', 0)),
+                    "K": k_val,
+                    "D": d_val,
+                    "I訊號": i_text
+                })
+        # --- 【新增邏輯結束】 ---
+        
+        if not display_data:
+             st.warning("所有符合條件的股票在後續分析中被過濾，無最終結果可顯示。")
+        else:
+            summary_df = pd.DataFrame(display_data)
+            # 使用 st.dataframe 讓表格可以排序，並將 HTML 渲染出來
+            st.markdown(summary_df.to_html(escape=False, index=False), unsafe_allow_html=True)
+
 
         st.subheader("個股分析圖表")
         for result in yahoo_results:
@@ -220,6 +255,10 @@ def display_ranking_results(market_type: str):
                 stock_symbol = result['stock_info']['Stock Symbol']
                 with st.expander(f"查看 {stock_name} ({stock_symbol}) 的技術分析圖"):
                     st.plotly_chart(result['chart_figure'], use_container_width=True)
+            else:
+                # 可以在這裡選擇是否顯示分析失敗的項目
+                stock_name = result['stock_info'].get('Stock Name', '未知股票')
+                st.error(f"分析 {stock_name} 時發生錯誤: {result.get('error')}")
 
 
 def display_single_stock_analysis(stock_identifier: str):
