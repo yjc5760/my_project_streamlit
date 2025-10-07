@@ -1,4 +1,4 @@
-# streamlit_app.py (完整修正版，已加入 Factor 欄位)
+# streamlit_app.py (完整修正版，已為籌碼集中度加入篩選條件說明)
 
 import streamlit as st
 
@@ -152,9 +152,20 @@ def display_concentration_results():
     with st.spinner("正在獲取並篩選籌碼集中度資料..."):
         stock_data = cached_fetch_concentration_data()
         if stock_data is not None:
-            filtered_stocks = filter_stock_data(stock_data)
+            filtered_stocks = filter_stock_data(stock_data) # 預設10日均量 > 2000
             if filtered_stocks is not None and not filtered_stocks.empty:
                 st.success(f"找到 {len(filtered_stocks)} 檔符合條件的股票。")
+
+                # --- 【這就是新增的區塊】 ---
+                st.info("""
+                **篩選條件：**
+                1.  5日集中度 > 10日集中度
+                2.  10日集中度 > 20日集中度
+                3.  5日與10日集中度皆 > 0
+                4.  10日均量 > 2000 張
+                """)
+                # --- 【新增區塊結束】 ---
+
                 st.dataframe(filtered_stocks)
                 
                 for _, stock in filtered_stocks.iterrows():
@@ -231,7 +242,7 @@ def display_ranking_results(market_type: str):
                     "漲跌幅(%)": stock_info.get('Change Percent', ''),
                     "預估量(張)": int(result.get('estimated_volume_lots', 0)),
                     "5日均量(張)": int(result.get('avg_vol_5_lots', 0)),
-                    "因子": f"{stock_info.get('Factor', 1.0):.2f}", # <-- 【新增此行】
+                    "因子": f"{stock_info.get('Factor', 1.0):.2f}",
                     "K": k_val,
                     "D": d_val,
                     "I訊號": i_text
