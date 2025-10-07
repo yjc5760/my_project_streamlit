@@ -1,4 +1,4 @@
-# streamlit_app.py (完整修正版)
+# streamlit_app.py (完整修正版，已加入 Factor 欄位)
 
 import streamlit as st
 
@@ -209,17 +209,14 @@ def display_ranking_results(market_type: str):
         st.subheader("篩選結果摘要")
         display_data = []
         
-        # --- 【這就是新增的關鍵邏輯】 ---
         for result in yahoo_results:
             if not result.get('error'):
                 stock_info = result['stock_info']
                 indicators = result.get('indicators', {})
                 
-                # 格式化 KD 值，處理可能的 None
                 k_val = f"{indicators.get('k'):.2f}" if indicators.get('k') is not None else "N/A"
                 d_val = f"{indicators.get('d'):.2f}" if indicators.get('d') is not None else "N/A"
                 
-                # 格式化階梯訊號 I_value
                 i_val = indicators.get('i_value')
                 i_text = str(i_val) if i_val is not None else "N/A"
                 if i_val is not None:
@@ -234,19 +231,17 @@ def display_ranking_results(market_type: str):
                     "漲跌幅(%)": stock_info.get('Change Percent', ''),
                     "預估量(張)": int(result.get('estimated_volume_lots', 0)),
                     "5日均量(張)": int(result.get('avg_vol_5_lots', 0)),
+                    "因子": f"{stock_info.get('Factor', 1.0):.2f}", # <-- 【新增此行】
                     "K": k_val,
                     "D": d_val,
                     "I訊號": i_text
                 })
-        # --- 【新增邏輯結束】 ---
         
         if not display_data:
              st.warning("所有符合條件的股票在後續分析中被過濾，無最終結果可顯示。")
         else:
             summary_df = pd.DataFrame(display_data)
-            # 使用 st.dataframe 讓表格可以排序，並將 HTML 渲染出來
             st.markdown(summary_df.to_html(escape=False, index=False), unsafe_allow_html=True)
-
 
         st.subheader("個股分析圖表")
         for result in yahoo_results:
@@ -256,7 +251,6 @@ def display_ranking_results(market_type: str):
                 with st.expander(f"查看 {stock_name} ({stock_symbol}) 的技術分析圖"):
                     st.plotly_chart(result['chart_figure'], use_container_width=True)
             else:
-                # 可以在這裡選擇是否顯示分析失敗的項目
                 stock_name = result['stock_info'].get('Stock Name', '未知股票')
                 st.error(f"分析 {stock_name} 時發生錯誤: {result.get('error')}")
 
