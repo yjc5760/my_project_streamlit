@@ -1,4 +1,4 @@
-# streamlit_app.py (完整修正版，已為籌碼集中度加入篩選條件說明)
+# streamlit_app.py (完整修正版，已為 Goodinfo 選股加入篩選條件說明)
 
 import streamlit as st
 
@@ -156,7 +156,6 @@ def display_concentration_results():
             if filtered_stocks is not None and not filtered_stocks.empty:
                 st.success(f"找到 {len(filtered_stocks)} 檔符合條件的股票。")
 
-                # --- 【這就是新增的區塊】 ---
                 st.info("""
                 **篩選條件：**
                 1.  5日集中度 > 10日集中度
@@ -164,7 +163,6 @@ def display_concentration_results():
                 3.  5日與10日集中度皆 > 0
                 4.  10日均量 > 2000 張
                 """)
-                # --- 【新增區塊結束】 ---
 
                 st.dataframe(filtered_stocks)
                 
@@ -189,6 +187,21 @@ def display_goodinfo_results():
     
     if scraped_df is not None and not scraped_df.empty:
         st.success(f"成功爬取到 {len(scraped_df)} 筆資料。")
+
+        # --- 【這就是新增的區塊】 ---
+        st.info("""
+        **篩選條件 (來自 Goodinfo 自訂篩選):**
+        1.  紅K棒棒幅 > 2.5%
+        2.  成交張數 > 5000張
+        3.  與季線乖離 : -5% ~ 5%
+        4.  週K值範圍 : 0 ~ 50
+        5.  週K值向上
+        6.  季線在月線之上 (空頭排列)
+        7.  日K值 > 日D值
+        8.  今日成交張數 > 1.3 X 昨日成交張數
+        """)
+        # --- 【新增區塊結束】 ---
+
         st.dataframe(scraped_df)
         
         for _, stock in scraped_df.iterrows():
