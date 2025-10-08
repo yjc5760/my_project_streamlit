@@ -147,9 +147,6 @@ def process_ranking_analysis(stock_df: pd.DataFrame) -> list:
 # Streamlit UI 介面佈局 (將每個 action 拆分成獨立函式)
 # --------------------------------------------------------------------------------
 
-# ==============================================================================
-# 【主要修改處】: 修改 display_concentration_results 函式
-# ==============================================================================
 def display_concentration_results():
     st.header("📊 1日籌碼集中度選股結果")
     with st.spinner("正在獲取並篩選籌碼集中度資料..."):
@@ -158,7 +155,6 @@ def display_concentration_results():
             filtered_stocks = filter_stock_data(stock_data) # 預設10日均量 > 2000
             
             if filtered_stocks is not None and not filtered_stocks.empty:
-                # --- 新增開始: 進行技術指標分析 ---
                 st.success(f"找到 {len(filtered_stocks)} 檔符合條件的股票，正在進行技術指標分析...")
                 
                 k_values = []
@@ -168,7 +164,6 @@ def display_concentration_results():
                 progress_bar = st.progress(0, text="分析進度")
                 total_stocks = len(filtered_stocks)
 
-                # 遍歷篩選出的股票，逐一獲取技術指標
                 for i, stock_row in enumerate(filtered_stocks.itertuples()):
                     stock_code = str(stock_row.代碼)
                     analysis_result = cached_analyze_stock(stock_code)
@@ -191,10 +186,8 @@ def display_concentration_results():
                 
                 progress_bar.empty()
 
-                # 將計算出的指標新增為新的欄位
                 filtered_stocks['KD'] = [f"K:{k} D:{d}" for k, d in zip(k_values, d_values)]
                 filtered_stocks['I值'] = i_values
-                # --- 新增結束 ---
 
                 st.info("""
                 **篩選條件：**
@@ -204,15 +197,12 @@ def display_concentration_results():
                 4.  10日均量 > 2000 張
                 """)
 
-                # --- 修改開始: 調整顯示欄位的順序 ---
                 display_columns = [
                     '編號', '代碼', '股票名稱', 'KD', 'I值', '1日集中度', '5日集中度',
                     '10日集中度', '20日集中度', '60日集中度', '120日集中度', '10日均量'
                 ]
-                # 確保所有要顯示的欄位都存在於 DataFrame 中
                 final_display_columns = [col for col in display_columns if col in filtered_stocks.columns]
                 st.dataframe(filtered_stocks[final_display_columns])
-                # --- 修改結束 ---
                 
                 for _, stock in filtered_stocks.iterrows():
                     stock_code = str(stock['代碼'])
@@ -227,19 +217,59 @@ def display_concentration_results():
                 st.warning("沒有找到或篩選出符合條件的股票。")
         else:
             st.error("無法獲取籌碼集中度資料。")
-# ==============================================================================
-# 【修改結束】
-# ==============================================================================
 
+# ==============================================================================
+# 【主要修改處】: 修改 display_goodinfo_results 函式
+# ==============================================================================
 def display_goodinfo_results():
     st.header("⭐ 我的選股 結果 (from Goodinfo)")
     with st.spinner("正在從 Goodinfo! 網站爬取資料..."):
         scraped_df = cached_scrape_goodinfo()
     
     if scraped_df is not None and not scraped_df.empty:
-        st.success(f"成功爬取到 {len(scraped_df)} 筆資料。")
+        # --- 新增開始: 進行技術指標分析 ---
+        st.success(f"成功爬取到 {len(scraped_df)} 筆資料，正在進行技術指標分析...")
 
-        # --- 【這就是新增的區塊】 ---
+        k_values = []
+        d_values = []
+        i_values = []
+        
+        progress_bar = st.progress(0, text="分析進度")
+        total_stocks = len(scraped_df)
+
+        for i, stock_row in enumerate(scraped_df.itertuples()):
+            stock_code = str(stock_row.代碼).strip()
+            if not stock_code or stock_code == 'nan':
+                k_values.append("N/A")
+                d_values.append("N/A")
+                i_values.append("N/A")
+                continue
+
+            analysis_result = cached_analyze_stock(stock_code)
+            
+            if analysis_result['status'] == 'success':
+                indicators = analysis_result.get('indicators', {})
+                k_val = indicators.get('k')
+                d_val = indicators.get('d')
+                i_val = indicators.get('i_value')
+                
+                k_values.append(f"{k_val:.2f}" if k_val is not None else "N/A")
+                d_values.append(f"{d_val:.2f}" if d_val is not None else "N/A")
+                i_values.append(i_val if i_val is not None else "N/A")
+            else:
+                k_values.append("錯誤")
+                d_values.append("錯誤")
+                i_values.append("錯誤")
+            
+            progress_bar.progress((i + 1) / total_stocks, text=f"正在分析: {stock_code}")
+
+        progress_bar.empty()
+
+        # 將計算出的指標新增為新的欄位
+        scraped_df['KD'] = [f"K:{k} D:{d}" for k, d in zip(k_values, d_values)]
+        scraped_df['I值'] = i_values
+        # --- 新增結束 ---
+
         st.info("""
         **篩選條件 (來自 Goodinfo 自訂篩選):**
         1.  紅K棒棒幅 > 2.5%
@@ -251,9 +281,17 @@ def display_goodinfo_results():
         7.  日K值 > 日D值
         8.  今日成交張數 > 1.3 X 昨日成交張數
         """)
-        # --- 【新增區塊結束】 ---
 
-        st.dataframe(scraped_df)
+        # --- 修改開始: 調整顯示欄位的順序 ---
+        # 原始欄位: ['代碼', '名稱', '市場', '股價日期', '成交', '漲跌價', '漲跌幅', '成交張數']
+        display_columns = [
+            '代碼', '名稱', 'KD', 'I值', '市場', '股價日期', 
+            '成交', '漲跌價', '漲跌幅', '成交張數'
+        ]
+        # 確保所有要顯示的欄位都存在於 DataFrame 中
+        final_display_columns = [col for col in display_columns if col in scraped_df.columns]
+        st.dataframe(scraped_df[final_display_columns])
+        # --- 修改結束 ---
         
         for _, stock in scraped_df.iterrows():
             stock_code = str(stock['代碼']).strip()
@@ -269,6 +307,9 @@ def display_goodinfo_results():
     else:
         st.warning("未爬取到任何資料。請檢查 Cookie 是否有效。")
 
+# ==============================================================================
+# 【修改結束】
+# ==============================================================================
 
 def display_ranking_results(market_type: str):
     st.header(f"🚀 漲幅排行榜 ({market_type})")
