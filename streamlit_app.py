@@ -1,22 +1,10 @@
-# streamlit_app.py (已整合月營收選股功能)
+# streamlit_app.py (已整合月營收選股功能並修正時區問題)
 
 import streamlit as st
-
-# --- 偵錯碼開始 ---
-# st.header("偵錯資訊：檢查 Secrets")
-# if 'goodinfo' in st.secrets and 'cookie' in st.secrets['goodinfo']:
-#     st.success("✅ 成功讀取到 Goodinfo Cookie！")
-#     # 為了安全，只顯示 Cookie 的一小部分
-#     st.write("Cookie 前15個字元:", st.secrets['goodinfo']['cookie'][:15], "...")
-# else:
-#     st.error("❌ 讀取 Goodinfo Cookie 失敗！")
-#     st.write("目前的 secrets 內容：")
-#     st.json(st.secrets.to_dict()) # 顯示所有讀取到的 secrets
-# --- 偵錯碼結束 ---
-
 import pandas as pd
 import os
-from datetime import datetime, timedelta
+from datetime import datetime
+from zoneinfo import ZoneInfo # 修正：導入 ZoneInfo
 import twstock
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed # OPTIMIZATION: For concurrent analysis
@@ -108,7 +96,7 @@ def process_ranking_analysis(stock_df: pd.DataFrame) -> list:
         # --- OPTIMIZATION: Concurrent analysis using ThreadPoolExecutor ---
         with ThreadPoolExecutor(max_workers=10) as executor:
             future_to_stock = {
-                executor.submit(cached_analyze_stock, str(stock_info['Stock Symbol']).strip()): stock_info 
+                executor.submit(cached_analyze_stock, str(stock_info['Stock Symbol']).strip()): stock_info
                 for stock_info in filtered_df.to_dict('records')
             }
             
@@ -286,7 +274,7 @@ def display_goodinfo_results():
         """)
 
         display_columns = [
-            '代碼', '名稱', 'KD', 'I值', '市場', '股價日期', 
+            '代碼', '名稱', 'KD', 'I值', '市場', '股價日期',
             '成交', '漲跌價', '漲跌幅', '成交張數'
         ]
         final_display_columns = [col for col in display_columns if col in scraped_df.columns]
@@ -490,7 +478,10 @@ def display_single_stock_analysis(stock_identifier: str):
 # --- 主程式進入點 ---
 def main():
     st.title("📈 台股互動分析儀")
-    st.caption(f"台北時間: {(datetime.now() + timedelta(hours=8)).strftime('%Y-%m-%d %H:%M:%S')}")
+
+    # --- 修正開始: 使用 ZoneInfo 獲取並顯示正確的台北時間 ---
+    st.caption(f"台北時間: {datetime.now(ZoneInfo('Asia/Taipei')).strftime('%Y-%m-%d %H:%M:%S')}")
+    # --- 修正結束 ---
 
     # --- 側邊欄 ---
     st.sidebar.header("選股策略")
