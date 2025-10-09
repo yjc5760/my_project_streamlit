@@ -1,4 +1,4 @@
-# yahoo_scraper.py (整合 yahoo_stock.py 和 yahoo_stock_otc.py)
+# yahoo_scraper.py (已修正時區問題)
 
 import requests
 import pandas as pd
@@ -6,12 +6,16 @@ from bs4 import BeautifulSoup
 from io import StringIO
 import re
 from datetime import datetime
+from zoneinfo import ZoneInfo # 修正：導入 ZoneInfo 模組
 
 def _get_volume_factor() -> float:
     """
     根據當前時間從內建的資料表查表並內插計算成交量預估因子。
     """
-    now_time = datetime.now().time()
+    # --- 修正開始 ---
+    # 修正後的寫法 (明確指定抓取台北時區的時間)
+    now_time = datetime.now(ZoneInfo("Asia/Taipei")).time()
+    # --- 修正結束 ---
     
     nine_am = datetime.strptime("09:00", "%H:%M").time()
     one_thirty_pm = datetime.strptime("13:30", "%H:%M").time()
@@ -77,7 +81,6 @@ def _get_volume_factor() -> float:
 13:30,1.00
 """   
 
-     
     try:
         df_factor = pd.read_csv(StringIO(csv_data), skipinitialspace=True)
         df_factor['Time'] = pd.to_datetime(df_factor['Time'], format='%H:%M').dt.time
@@ -171,7 +174,7 @@ def scrape_yahoo_stock_rankings(url: str) -> pd.DataFrame | None:
             return None
             
         factor = _get_volume_factor()
-        print(f"當前時間 {datetime.now().strftime('%H:%M:%S')}，預估成交量因子: {factor:.2f}")
+        print(f"當前時間 {datetime.now(ZoneInfo('Asia/Taipei')).strftime('%H:%M:%S')}，預估成交量因子: {factor:.2f}")
         
         df['Factor'] = factor
         df['Volume (Shares)'] = pd.to_numeric(df['Volume (Shares)'], errors='coerce')
