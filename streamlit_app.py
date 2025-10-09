@@ -1,4 +1,4 @@
-# streamlit_app.py (完整修正版，已為 Goodinfo 選股加入篩選條件說明)
+# streamlit_app.py (已整合月營收選股功能)
 
 import streamlit as st
 
@@ -24,7 +24,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed # OPTIMIZATION: 
 # --- OPTIMIZATION: Updated imports for consolidated scraper ---
 try:
     from scraper import scrape_goodinfo
-    # 使用新的通用 yahoo_scraper 模組
+    # --- 新增開始: 導入月營收爬蟲並重新命名 ---
+    from monthly_revenue_scraper import scrape_goodinfo as scrape_monthly_revenue
+    # --- 新增結束 ---
     from yahoo_scraper import scrape_yahoo_stock_rankings
     from stock_analyzer import analyze_stock
     from stock_information_plot import plot_stock_revenue_trend, plot_stock_major_shareholders, get_stock_code
@@ -51,6 +53,12 @@ else:
 @st.cache_data(ttl=600) # 快取10分鐘
 def cached_scrape_goodinfo():
     return scrape_goodinfo()
+
+# --- 新增開始: 為月營收爬蟲建立快取函式 ---
+@st.cache_data(ttl=1800) # 快取30分鐘
+def cached_scrape_monthly_revenue():
+    return scrape_monthly_revenue()
+# --- 新增結束 ---
 
 @st.cache_data(ttl=600)
 def cached_fetch_concentration_data():
@@ -218,16 +226,13 @@ def display_concentration_results():
         else:
             st.error("無法獲取籌碼集中度資料。")
 
-# ==============================================================================
-# 【主要修改處】: 修改 display_goodinfo_results 函式
-# ==============================================================================
+
 def display_goodinfo_results():
     st.header("⭐ 我的選股 結果 (from Goodinfo)")
     with st.spinner("正在從 Goodinfo! 網站爬取資料..."):
         scraped_df = cached_scrape_goodinfo()
     
     if scraped_df is not None and not scraped_df.empty:
-        # --- 新增開始: 進行技術指標分析 ---
         st.success(f"成功爬取到 {len(scraped_df)} 筆資料，正在進行技術指標分析...")
 
         k_values = []
@@ -265,10 +270,8 @@ def display_goodinfo_results():
 
         progress_bar.empty()
 
-        # 將計算出的指標新增為新的欄位
         scraped_df['KD'] = [f"K:{k} D:{d}" for k, d in zip(k_values, d_values)]
         scraped_df['I值'] = i_values
-        # --- 新增結束 ---
 
         st.info("""
         **篩選條件 (來自 Goodinfo 自訂篩選):**
@@ -282,16 +285,12 @@ def display_goodinfo_results():
         8.  今日成交張數 > 1.3 X 昨日成交張數
         """)
 
-        # --- 修改開始: 調整顯示欄位的順序 ---
-        # 原始欄位: ['代碼', '名稱', '市場', '股價日期', '成交', '漲跌價', '漲跌幅', '成交張數']
         display_columns = [
             '代碼', '名稱', 'KD', 'I值', '市場', '股價日期', 
             '成交', '漲跌價', '漲跌幅', '成交張數'
         ]
-        # 確保所有要顯示的欄位都存在於 DataFrame 中
         final_display_columns = [col for col in display_columns if col in scraped_df.columns]
         st.dataframe(scraped_df[final_display_columns])
-        # --- 修改結束 ---
         
         for _, stock in scraped_df.iterrows():
             stock_code = str(stock['代碼']).strip()
@@ -307,9 +306,92 @@ def display_goodinfo_results():
     else:
         st.warning("未爬取到任何資料。請檢查 Cookie 是否有效。")
 
-# ==============================================================================
-# 【修改結束】
-# ==============================================================================
+
+# --- 新增開始: 月營收選股結果顯示函式 ---
+def display_monthly_revenue_results():
+    st.header("📈 月營收強勢股 (from Goodinfo)")
+    with st.spinner("正在從 Goodinfo! 網站爬取月營收資料..."):
+        scraped_df = cached_scrape_monthly_revenue()
+
+    if scraped_df is not None and not scraped_df.empty:
+        st.success(f"成功爬取到 {len(scraped_df)} 筆資料，正在進行技術指標分析...")
+
+        k_values = []
+        d_values = []
+        i_values = []
+
+        progress_bar = st.progress(0, text="分析進度")
+        total_stocks = len(scraped_df)
+
+        for i, stock_row in enumerate(scraped_df.itertuples()):
+            stock_code = str(stock_row.代碼).strip()
+            if not stock_code or stock_code == 'nan':
+                k_values.append("N/A")
+                d_values.append("N/A")
+                i_values.append("N/A")
+                continue
+
+            analysis_result = cached_analyze_stock(stock_code)
+
+            if analysis_result['status'] == 'success':
+                indicators = analysis_result.get('indicators', {})
+                k_val = indicators.get('k')
+                d_val = indicators.get('d')
+                i_val = indicators.get('i_value')
+
+                k_values.append(f"{k_val:.2f}" if k_val is not None else "N/A")
+                d_values.append(f"{d_val:.2f}" if d_val is not None else "N/A")
+                i_values.append(i_val if i_val is not None else "N/A")
+            else:
+                k_values.append("錯誤")
+                d_values.append("錯誤")
+                i_values.append("錯誤")
+
+            progress_bar.progress((i + 1) / total_stocks, text=f"正在分析: {stock_code}")
+
+        progress_bar.empty()
+
+        scraped_df['KD'] = [f"K:{k} D:{d}" for k, d in zip(k_values, d_values)]
+        scraped_df['I值'] = i_values
+
+        st.info("""
+        **篩選條件 (來自 Goodinfo 月營收自訂篩選):**
+        1.  單月營收年增率(%) - 當月 > 15%
+        2.  單月營收年增率(%) - 前1月 > 10%
+        3.  單月營收年增率(%) - 前2月 > 10%
+        4.  單月營收年增率(%) - 前3月 > 10%
+        5.  單月營收年增率(%) - 前4月 > 10%
+        6.  單月營收創歷年同期前3高
+        """)
+
+        # 重新排序並選擇要顯示的欄位
+        all_cols = scraped_df.columns.tolist()
+        # 將新欄位置於 '名稱' 之後
+        try:
+            name_idx = all_cols.index('名稱')
+            new_cols = all_cols[:name_idx+1] + ['KD', 'I值'] + [c for c in all_cols[name_idx+1:] if c not in ['KD', 'I值']]
+            scraped_df = scraped_df[new_cols]
+        except ValueError:
+            # 如果找不到 '名稱' 欄位，就直接在最前面加上新欄位
+            scraped_df = scraped_df[['代碼', '名稱', 'KD', 'I值'] + [c for c in all_cols if c not in ['代碼', '名稱', 'KD', 'I值']]]
+        
+        st.dataframe(scraped_df)
+
+        for _, stock in scraped_df.iterrows():
+            stock_code = str(stock['代碼']).strip()
+            stock_name = str(stock['名稱']).strip()
+            if not stock_code or stock_code == 'nan': continue
+
+            with st.expander(f"查看 {stock_name} ({stock_code}) 的技術分析圖"):
+                analysis_result = cached_analyze_stock(stock_code)
+                if analysis_result['status'] == 'success':
+                    st.plotly_chart(analysis_result['chart_figure'], use_container_width=True)
+                else:
+                    st.error(f"為 {stock_name} 生成圖表時出錯: {analysis_result.get('message', '未知錯誤')}")
+    else:
+        st.warning("未爬取到任何月營收資料。請檢查 Cookie 是否有效。")
+# --- 新增結束 ---
+
 
 def display_ranking_results(market_type: str):
     st.header(f"🚀 漲幅排行榜 ({market_type})")
@@ -416,6 +498,10 @@ def main():
         st.session_state.action = "concentration_pick"
     if st.sidebar.button("我的選股 (Goodinfo)"):
         st.session_state.action = "my_stock_picks"
+    # --- 新增開始: 月營收選股按鈕 ---
+    if st.sidebar.button("月營收選股 (Goodinfo)"):
+        st.session_state.action = "monthly_revenue_pick"
+    # --- 新增結束 ---
 
     st.sidebar.header("盤中即時排行")
     if st.sidebar.button("漲幅排行榜 (上市)"):
@@ -439,6 +525,10 @@ def main():
             display_concentration_results()
         elif action == "my_stock_picks":
             display_goodinfo_results()
+        # --- 新增開始: 月營收選股路由 ---
+        elif action == "monthly_revenue_pick":
+            display_monthly_revenue_results()
+        # --- 新增結束 ---
         elif action == "rank_listed":
             display_ranking_results("上市")
         elif action == "rank_otc":
