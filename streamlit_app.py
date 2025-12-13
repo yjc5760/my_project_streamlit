@@ -1,20 +1,17 @@
-# streamlit_app.py (已整合月營收選股功能並修正時區問題)
+# streamlit_app.py (已整合月營收選股功能、修正時區問題，並加入表格下載CSV功能)
 
 import streamlit as st
 import pandas as pd
 import os
 from datetime import datetime
-from zoneinfo import ZoneInfo # 修正：導入 ZoneInfo
+from zoneinfo import ZoneInfo
 import twstock
 import numpy as np
-from concurrent.futures import ThreadPoolExecutor, as_completed # OPTIMIZATION: For concurrent analysis
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# --- OPTIMIZATION: Updated imports for consolidated scraper ---
 try:
     from scraper import scrape_goodinfo
-    # --- 新增開始: 導入月營收爬蟲並重新命名 ---
     from monthly_revenue_scraper import scrape_goodinfo as scrape_monthly_revenue
-    # --- 新增結束 ---
     from yahoo_scraper import scrape_yahoo_stock_rankings
     from stock_analyzer import analyze_stock
     from stock_information_plot import plot_stock_revenue_trend, plot_stock_major_shareholders, get_stock_code
@@ -42,11 +39,9 @@ else:
 def cached_scrape_goodinfo():
     return scrape_goodinfo()
 
-# --- 新增開始: 為月營收爬蟲建立快取函式 ---
 @st.cache_data(ttl=1800) # 快取30分鐘
 def cached_scrape_monthly_revenue():
     return scrape_monthly_revenue()
-# --- 新增結束 ---
 
 @st.cache_data(ttl=600)
 def cached_fetch_concentration_data():
@@ -93,7 +88,6 @@ def process_ranking_analysis(stock_df: pd.DataFrame) -> list:
         progress_bar = st.progress(0)
         total_stocks = len(filtered_df)
         
-        # --- OPTIMIZATION: Concurrent analysis using ThreadPoolExecutor ---
         with ThreadPoolExecutor(max_workers=10) as executor:
             future_to_stock = {
                 executor.submit(cached_analyze_stock, str(stock_info['Stock Symbol']).strip()): stock_info
@@ -120,7 +114,6 @@ def process_ranking_analysis(stock_df: pd.DataFrame) -> list:
                             })
                             results_list.append(result_item)
                     else:
-                         # 即使分析失敗也加入列表，以便後續顯示錯誤訊息
                         result_item['error'] = analysis_result.get('message', '未知錯誤')
                         results_list.append(result_item)
 
@@ -140,7 +133,7 @@ def process_ranking_analysis(stock_df: pd.DataFrame) -> list:
 
 
 # --------------------------------------------------------------------------------
-# Streamlit UI 介面佈局 (將每個 action 拆分成獨立函式)
+# Streamlit UI 介面佈局
 # --------------------------------------------------------------------------------
 
 def display_concentration_results():
@@ -148,7 +141,7 @@ def display_concentration_results():
     with st.spinner("正在獲取並篩選籌碼集中度資料..."):
         stock_data = cached_fetch_concentration_data()
         if stock_data is not None:
-            filtered_stocks = filter_stock_data(stock_data) # 預設10日均量 > 2000
+            filtered_stocks = filter_stock_data(stock_data) 
             
             if filtered_stocks is not None and not filtered_stocks.empty:
                 st.success(f"找到 {len(filtered_stocks)} 檔符合條件的股票，正在進行技術指標分析...")
@@ -295,7 +288,6 @@ def display_goodinfo_results():
         st.warning("未爬取到任何資料。請檢查 Cookie 是否有效。")
 
 
-# --- 新增開始: 月營收選股結果顯示函式 ---
 def display_monthly_revenue_results():
     st.header("📈 月營收強勢股 (from Goodinfo)")
     with st.spinner("正在從 Goodinfo! 網站爬取月營收資料..."):
@@ -352,15 +344,12 @@ def display_monthly_revenue_results():
         6.  單月營收創歷年同期前3高
         """)
 
-        # 重新排序並選擇要顯示的欄位
         all_cols = scraped_df.columns.tolist()
-        # 將新欄位置於 '名稱' 之後
         try:
             name_idx = all_cols.index('名稱')
             new_cols = all_cols[:name_idx+1] + ['KD', 'I值'] + [c for c in all_cols[name_idx+1:] if c not in ['KD', 'I值']]
             scraped_df = scraped_df[new_cols]
         except ValueError:
-            # 如果找不到 '名稱' 欄位，就直接在最前面加上新欄位
             scraped_df = scraped_df[['代碼', '名稱', 'KD', 'I值'] + [c for c in all_cols if c not in ['代碼', '名稱', 'KD', 'I值']]]
         
         st.dataframe(scraped_df)
@@ -378,7 +367,6 @@ def display_monthly_revenue_results():
                     st.error(f"為 {stock_name} 生成圖表時出錯: {analysis_result.get('message', '未知錯誤')}")
     else:
         st.warning("未爬取到任何月營收資料。請檢查 Cookie 是否有效。")
-# --- 新增結束 ---
 
 
 def display_ranking_results(market_type: str):
@@ -404,10 +392,8 @@ def display_ranking_results(market_type: str):
                 d_val = f"{indicators.get('d'):.2f}" if indicators.get('d') is not None else "N/A"
                 
                 i_val = indicators.get('i_value')
+                # 這裡只儲存純文字值，不加入HTML標籤，以便 CSV 下載正確資料
                 i_text = str(i_val) if i_val is not None else "N/A"
-                if i_val is not None:
-                    i_color = 'red' if i_val > 0 else 'green'
-                    i_text = f'<span style="color:{i_color};">{i_val}</span>'
 
                 display_data.append({
                     "排名": stock_info.get('Rank', ''),
@@ -417,7 +403,7 @@ def display_ranking_results(market_type: str):
                     "漲跌幅(%)": stock_info.get('Change Percent', ''),
                     "預估量(張)": int(result.get('estimated_volume_lots', 0)),
                     "5日均量(張)": int(result.get('avg_vol_5_lots', 0)),
-                    "因子": f"{stock_info.get('Factor', 1.0):.2f}",
+                    "因子": float(f"{stock_info.get('Factor', 1.0):.2f}"), # 轉為浮點數方便處理
                     "K": k_val,
                     "D": d_val,
                     "I訊號": i_text
@@ -427,7 +413,38 @@ def display_ranking_results(market_type: str):
              st.warning("所有符合條件的股票在後續分析中被過濾，無最終結果可顯示。")
         else:
             summary_df = pd.DataFrame(display_data)
-            st.markdown(summary_df.to_html(escape=False, index=False), unsafe_allow_html=True)
+
+            # 定義樣式函式：僅用於顯示顏色
+            def highlight_signal(val):
+                if val == "N/A":
+                    return ''
+                try:
+                    v = float(val)
+                    if v > 0:
+                        return 'color: red; font-weight: bold;'
+                    elif v < 0:
+                        return 'color: green; font-weight: bold;'
+                    return ''
+                except ValueError:
+                    return ''
+
+            # 套用樣式
+            styled_df = summary_df.style.map(highlight_signal, subset=['I訊號'])
+
+            # 使用 st.dataframe 顯示，這樣滑鼠移上去時右上角會出現 CSV 下載按鈕
+            # 並且使用 column_config 來格式化數字 (例如不顯示逗號或指定精度)
+            st.dataframe(
+                styled_df, 
+                use_container_width=True,
+                column_config={
+                    "排名": st.column_config.NumberColumn(format="%d"),
+                    "代碼": st.column_config.TextColumn(), # 防止代碼被當成數字加逗號
+                    "成交價": st.column_config.NumberColumn(format="%.2f"),
+                    "漲跌幅(%)": st.column_config.NumberColumn(format="%.2f"),
+                    "預估量(張)": st.column_config.NumberColumn(format="%d"),
+                    "5日均量(張)": st.column_config.NumberColumn(format="%d"),
+                }
+            )
 
         st.subheader("個股分析圖表")
         for result in yahoo_results:
@@ -479,9 +496,7 @@ def display_single_stock_analysis(stock_identifier: str):
 def main():
     st.title("📈 台股互動分析儀")
 
-    # --- 修正開始: 使用 ZoneInfo 獲取並顯示正確的台北時間 ---
     st.caption(f"台北時間: {datetime.now(ZoneInfo('Asia/Taipei')).strftime('%Y-%m-%d %H:%M:%S')}")
-    # --- 修正結束 ---
 
     # --- 側邊欄 ---
     st.sidebar.header("選股策略")
@@ -489,10 +504,8 @@ def main():
         st.session_state.action = "concentration_pick"
     if st.sidebar.button("我的選股 (Goodinfo)"):
         st.session_state.action = "my_stock_picks"
-    # --- 新增開始: 月營收選股按鈕 ---
     if st.sidebar.button("月營收選股 (Goodinfo)"):
         st.session_state.action = "monthly_revenue_pick"
-    # --- 新增結束 ---
 
     st.sidebar.header("盤中即時排行")
     if st.sidebar.button("漲幅排行榜 (上市)"):
@@ -516,10 +529,8 @@ def main():
             display_concentration_results()
         elif action == "my_stock_picks":
             display_goodinfo_results()
-        # --- 新增開始: 月營收選股路由 ---
         elif action == "monthly_revenue_pick":
             display_monthly_revenue_results()
-        # --- 新增結束 ---
         elif action == "rank_listed":
             display_ranking_results("上市")
         elif action == "rank_otc":
