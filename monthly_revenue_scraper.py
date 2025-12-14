@@ -11,23 +11,23 @@ URL = "https://goodinfo.tw/tw/StockListFilter/StockList.asp?STEP=DATA&MARKET_CAT
 # 【重要】：Goodinfo 依賴 Referer 和 User-Agent，且您的篩選條件需要 Cookie
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
-    "Referer": "https://goodinfo.tw/",  # 許多網站會檢查這個
-    # ------------------------------------------------------------------
-    # 【請注意】：因為您提到需要登入才能查看，且網址包含自訂篩選條件，
-    # 請務必將瀏覽器中的 Cookie 字串貼在下方引號中，否則爬蟲將無法取得正確資料。
-    # ------------------------------------------------------------------
+    "Referer": "https://goodinfo.tw/",
+    # 請確保此 Cookie 有效
     "Cookie": "__qca=I0-2120255871-1765697107313; CLIENT%5FID=20251110163553320%5F114%2E37%2E222%2E90; _ga=GA1.1.832428120.1762763765; _cc_id=ada7690de47741c349f179f457208c78; LOGIN=EMAIL=yjc5760%40gmail%2Ecom&USER%5FNM=YJ+Chen&ACCOUNT%5FID=107359590931917990151&ACCOUNT%5FVENDOR=Google&NO%5FEXPIRE=T; IS_TOUCH_DEVICE=F; SCREEN_SIZE=WIDTH=1920&HEIGHT=1080; panoramaId_expiry=1766301878708; panoramaId=9e81e8765c9bd09c413245655ac1185ca02c4a4dd131c4f03e107d1ddf5200a4; panoramaIdType=panoDevice; __gads=ID=26c4020a504f4925:T=1762763767:RT=1765697079:S=ALNI_MYlg_2Y6k-m7aDIXN1sqaq0pis3Yw; __gpi=UID=000011b284b2036e:T=1762763767:RT=1765697079:S=ALNI_MbFAko50gF8iaVeMc75CATgrEO8MQ; __eoi=ID=7b4c554b1803ff64:T=1762763767:RT=1765697079:S=AA-AfjaRA69ugEU-b6Qdv3vI8WTB; FCCDCF=%5Bnull%2Cnull%2Cnull%2Cnull%2Cnull%2Cnull%2C%5B%5B32%2C%22%5B%5C%224073ca81-6853-4cdc-b16a-44f26bfae1c0%5C%22%2C%5B1762763765%2C349000000%5D%5D%22%5D%5D%5D; cto_bidid=b2hFhV9OQVQ0ZUo4V2t5cndUc3E3ejdqWEJKd1FHT3JhZFk0bDhHVmdydEhTWTFlQjBlenBTdlBwRnlRTmV3d0lqaVVZT1l0VUdHOEFhbmRaeVludDdqcnN6WnQweWZ3SFRYM3FsejhWSjJOajdsMCUzRA; FCNEC=%5B%5B%22AKsRol9Bt7FsXXKtCJF8UwBni-lrqnqPD0nYZur4YWfypR8gHChWKzv8n8K7GpvMHYuXxg4m0Lzw0hDnOVGe5BVrb7yVckln82lXSPN4yDo_3jYImevURBqgCICUAEBs5gibJ2Gjts3uMyoCkZ5xCuyXCfJs2zZ5Dg%3D%3D%22%5D%5D; cto_bundle=5nQkw180ZHJ6RVJQd3VzalVnakZybTFaUG1FVGFySlVZRzRWeDJtM0JycXVVYzFSWlNPeDk3dXUzVENCWVlhNVlLc0hnNGt3JTJGbjZhbUtkUTJOUkIyc21OdTNVR3JUTG5XVkRXazRETXd5YXE4SHBlVHdTWnVVMVFCTlJTVjc1TmZKcDJKWHZxRmlidzBKTlhjZW1Md0g0amhiQSUzRCUzRA; SESSION%5FVAL=55647860%2E27; _ga_0LP5MLQS7E=GS2.1.s1765697076$o3$g1$t1765697251$j57$l0$h0" 
 }
 
-# 目標 CSS 選擇器 (您提供的 ID 是一個 div，我們將解析這個 div 內的表格)
+# 目標 CSS 選擇器
 TARGET_SELECTOR = "#divStockList"
 
-def main():
+def scrape_goodinfo():
+    """
+    爬取 Goodinfo 月營收篩選資料並回傳 DataFrame。
+    """
     # 使用 Session 物件來保持連線狀態
     session = requests.Session()
 
     try:
-        print("1. 正在發送請求...")
+        print("1. 正在發送請求 (月營收)...")
         response = session.get(URL, headers=HEADERS, timeout=15)
         
         # 強制設定編碼為 utf-8 (Goodinfo 有時會需要)
@@ -43,36 +43,48 @@ def main():
             target_element = soup.select_one(TARGET_SELECTOR)
             
             if target_element:
-                print(f"   已找到目標區塊: {TARGET_SELECTOR}")
-                
                 # 將找到的區塊 HTML 轉為字串，交給 pandas 解析表格
-                # pandas 會自動抓取該區塊內的所有 <table>
-                # io.StringIO 用於避免 pandas 未來版本的警告
                 html_io = io.StringIO(str(target_element))
                 dfs = pd.read_html(html_io, flavor='bs4')
                 
                 if dfs:
-                    # 通常第一個表格就是主要資料，如果有錯位，可以嘗試 dfs[1]
                     df = dfs[0]
                     
-                    print("3. 資料整理完成！")
-                    print("-" * 30)
-                    print(f"   擷取到的資料維度: {df.shape}")
-                    print("-" * 30)
-                    print(df.head()) # 顯示前 5 筆資料
+                    # 簡單的資料清理
+                    # 如果欄位是 MultiIndex (多層索引)，嘗試簡化
+                    if isinstance(df.columns, pd.MultiIndex):
+                        df.columns = df.columns.get_level_values(-1)
+                        
+                    # 確保代碼欄位存在且格式正確
+                    if '代號' in df.columns:
+                        df.rename(columns={'代號': '代碼'}, inplace=True)
                     
-                    # 選擇性：將資料儲存為 CSV
-                    # df.to_csv("goodinfo_stock_data.csv", index=False, encoding="utf-8-sig")
+                    if '代碼' in df.columns:
+                        # 移除可能的非數字字符，保留純數字代碼 (視需求而定)
+                        # 許多時候 Goodinfo 會在代碼後加註 "KY" 等，這裡暫時保留原樣或轉字串
+                        df['代碼'] = df['代碼'].astype(str)
+
+                    print("3. 資料擷取成功！")
+                    return df
                 else:
                     print("錯誤：在目標區塊內找不到任何表格 (<table>)。")
+                    return None
             else:
                 print(f"錯誤：找不到符合選擇器 '{TARGET_SELECTOR}' 的區塊。")
                 print("偵錯提示：這可能是因為 Cookie 失效，導致網站重新導向到首頁或登入頁。")
+                return None
         else:
             print(f"錯誤：請求失敗，狀態碼: {response.status_code}")
+            return None
 
     except Exception as e:
         print(f"發生未預期的錯誤: {e}")
+        return None
 
 if __name__ == "__main__":
-    main()
+    # 獨立測試時執行
+    df = scrape_goodinfo()
+    if df is not None:
+        print(df.head())
+    else:
+        print("測試失敗，未取得資料。")
