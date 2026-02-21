@@ -93,12 +93,13 @@ class TaiwanStockAnalyzer:
     
     # --- 指標計算函式 (邏輯不變) ---
     def calculate_weighted_moving_average(self, prices, period):
-        result = np.zeros_like(prices, dtype=float)
-        result[:] = np.nan
-        weight_sum = period * (period + 1) / 2
-        for i in range(period - 1, len(prices)):
-            weighted_sum = sum(prices[i - j] * (period - j) for j in range(period))
-            result[i] = weighted_sum / weight_sum
+        weights = np.arange(1, period + 1, dtype=float)
+        weight_sum = weights.sum()
+        kernel = weights[::-1]  # 最新的權重最大
+        result = np.full(len(prices), np.nan)
+        # 使用 np.convolve 取代 Python 迴圈，效能提升顯著
+        conv = np.convolve(prices, kernel, mode='full')[:len(prices)]
+        result[period - 1:] = conv[period - 1:] / weight_sum
         return result
 
     def _calculate_sma(self, data, period):
@@ -143,27 +144,37 @@ class TaiwanStockAnalyzer:
     def calculate_signals(self) -> None:
         self.indicators['I_value'] = self._calculate_stair_signal()
         self.indicators['J_value'] = self._calculate_deviation_signal()
-        self.indicators['K_value'] = [3 if dev >= 0 else -3 for dev in self.indicators['dev_5_60']]
-        self.indicators['L_value'] = [100 if k >= 80 else (0 if k <= 20 else np.nan) for k in self.indicators['k']]
+        dev_5_60 = self.indicators['dev_5_60']
+        k = self.indicators['k']
+        self.indicators['K_value'] = np.where(dev_5_60 >= 0, 3, -3)
+        self.indicators['L_value'] = np.where(k >= 80, 100, np.where(k <= 20, 0, np.nan))
 
-    def _calculate_stair_signal(self) -> list:
-        # (此函式邏輯不變)
-        signals = []
-        for i in range(len(self.price_data)):
-            dev_5_20 = self.indicators['dev_5_20'][i]
-            dev_20_60 = self.indicators['dev_20_60'][i]
-            dev_5_60 = self.indicators['dev_5_60'][i]
-            if dev_5_20 >= dev_5_60 and dev_5_60 >= dev_20_60: signals.append(1)
-            elif dev_5_60 >= dev_5_20 and dev_5_20 >= dev_20_60: signals.append(2)
-            elif dev_5_60 >= dev_20_60 and dev_20_60 >= dev_5_20: signals.append(3)
-            elif dev_20_60 >= dev_5_60 and dev_5_60 >= dev_5_20: signals.append(-1)
-            elif dev_20_60 >= dev_5_20 and dev_5_20 >= dev_5_60: signals.append(-2)
-            else: signals.append(-3)
+    def _calculate_stair_signal(self) -> np.ndarray:
+        a = self.indicators['dev_5_20']
+        b = self.indicators['dev_20_60']
+        c = self.indicators['dev_5_60']
+        # 向量化替代 Python 迴圈
+        signals = np.where(
+            (a >= c) & (c >= b), 1,
+            np.where(
+                (c >= a) & (a >= b), 2,
+                np.where(
+                    (c >= b) & (b >= a), 3,
+                    np.where(
+                        (b >= c) & (c >= a), -1,
+                        np.where(
+                            (b >= a) & (a >= c), -2,
+                            -3
+                        )
+                    )
+                )
+            )
+        )
         return signals
 
-    def _calculate_deviation_signal(self) -> list:
-        # (此函式邏輯不變)
-        return [4 if dev >= 5 else (-4 if dev <= -5 else np.nan) for dev in self.indicators['dev_1_20']]
+    def _calculate_deviation_signal(self) -> np.ndarray:
+        dev = self.indicators['dev_1_20']
+        return np.where(dev >= 5, 4, np.where(dev <= -5, -4, np.nan))
 
     def create_chart(self) -> go.Figure:
         """
