@@ -8,23 +8,8 @@ import re
 from datetime import datetime
 from zoneinfo import ZoneInfo # 修正：導入 ZoneInfo 模組
 
-def _get_volume_factor() -> float:
-    """
-    根據當前時間從內建的資料表查表並內插計算成交量預估因子。
-    """
-    # --- 修正開始 ---
-    # 修正後的寫法 (明確指定抓取台北時區的時間)
-    now_time = datetime.now(ZoneInfo("Asia/Taipei")).time()
-    # --- 修正結束 ---
-    
-    nine_am = datetime.strptime("09:00", "%H:%M").time()
-    one_thirty_pm = datetime.strptime("13:30", "%H:%M").time()
-    
-    if now_time <= nine_am or now_time >= one_thirty_pm:
-        return 1.0
-    
-    # 將 預估量.csv 的資料直接寫在程式碼中
-    csv_data = """Time,Factor
+# 預估成交量因子表：模組載入時建立一次，後續查表不重複解析
+_CSV_DATA = """Time,Factor
 9:05,14.99
 9:10,9.48
 9:15,7.12
@@ -79,14 +64,24 @@ def _get_volume_factor() -> float:
 13:20,1.09
 13:25,1.06
 13:30,1.00
-"""   
+"""
+_FACTOR_TABLE = pd.read_csv(StringIO(_CSV_DATA), skipinitialspace=True)
+_FACTOR_TABLE['Time'] = pd.to_datetime(_FACTOR_TABLE['Time'], format='%H:%M').dt.time
 
-    try:
-        df_factor = pd.read_csv(StringIO(csv_data), skipinitialspace=True)
-        df_factor['Time'] = pd.to_datetime(df_factor['Time'], format='%H:%M').dt.time
-    except Exception as e:
-        print(f"錯誤：處理內建的預估因子資料時發生錯誤: {e}。預估因子將設為 1。")
+
+def _get_volume_factor() -> float:
+    """
+    根據當前時間從模組層級的因子表查表並內插計算成交量預估因子。
+    """
+    now_time = datetime.now(ZoneInfo("Asia/Taipei")).time()
+
+    nine_am = datetime.strptime("09:00", "%H:%M").time()
+    one_thirty_pm = datetime.strptime("13:30", "%H:%M").time()
+
+    if now_time <= nine_am or now_time >= one_thirty_pm:
         return 1.0
+
+    df_factor = _FACTOR_TABLE
 
     exact_match = df_factor[df_factor['Time'] == now_time]
     if not exact_match.empty:
@@ -95,10 +90,10 @@ def _get_volume_factor() -> float:
     upper_bound_df = df_factor[df_factor['Time'] > now_time]
     if upper_bound_df.empty:
         return df_factor.iloc[-1]['Factor']
-        
+
     upper_bound = upper_bound_df.iloc[0]
     lower_bound = df_factor[df_factor['Time'] < now_time].iloc[-1]
-    
+
     def time_to_seconds(t):
         return t.hour * 3600 + t.minute * 60 + t.second
 
@@ -180,7 +175,10 @@ def scrape_yahoo_stock_rankings(url: str) -> pd.DataFrame | None:
         df['Volume (Shares)'] = pd.to_numeric(df['Volume (Shares)'], errors='coerce')
         df['Estimated Volume'] = (df['Volume (Shares)'] * factor).round(0).astype('Int64')
 
-        df['Stock Symbol'] = df['Stock Symbol'].astype(str).apply(lambda x: re.findall(r'\d+', x)[0] if re.findall(r'\d+', x) else None)
+        def _extract_digits(x):
+            m = re.findall(r'\d+', x)
+            return m[0] if m else None
+        df['Stock Symbol'] = df['Stock Symbol'].astype(str).apply(_extract_digits)
         df['Stock Symbol'] = pd.to_numeric(df['Stock Symbol'], errors='coerce').fillna(0).astype('int64')
 
         return df
