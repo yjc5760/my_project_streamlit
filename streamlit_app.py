@@ -27,10 +27,21 @@ except ImportError as e:
 # --------------------------------------------------------------------------------
 st.set_page_config(page_title="台股分析儀", layout="wide", initial_sidebar_state="expanded")
 
-if 'FINMIND_API_TOKEN' in st.secrets:
-    os.environ['FINMIND_API_TOKEN'] = st.secrets['FINMIND_API_TOKEN']
-else:
-    st.warning("在 Streamlit secrets 中找不到 FinMind API token。部分圖表可能無法生成。")
+try:
+    # 雲端部署時從 Streamlit secrets 讀取；本機執行時略過（可用環境變數或 .streamlit/secrets.toml）
+    if 'FINMIND_API_TOKEN' in st.secrets:
+        os.environ['FINMIND_API_TOKEN'] = st.secrets['FINMIND_API_TOKEN']
+    else:
+        st.warning("在 Streamlit secrets 中找不到 FinMind API token。部分圖表可能無法生成。")
+    # 將 Goodinfo Cookie 從 secrets 注入環境變數，供 scraper 使用
+    if 'GOODINFO_COOKIE_MY_STOCK' in st.secrets:
+        os.environ['GOODINFO_COOKIE_MY_STOCK'] = st.secrets['GOODINFO_COOKIE_MY_STOCK']
+    if 'GOODINFO_COOKIE_MONTHLY' in st.secrets:
+        os.environ['GOODINFO_COOKIE_MONTHLY'] = st.secrets['GOODINFO_COOKIE_MONTHLY']
+except Exception:
+    # 本機執行且無 secrets.toml 時，嘗試從環境變數取得
+    if not os.getenv('FINMIND_API_TOKEN'):
+        st.warning("未設定 FinMind API token（環境變數或 secrets.toml）。部分圖表可能無法生成。")
 
 # --------------------------------------------------------------------------------
 # OPTIMIZATION: Cached Data Fetching Functions
@@ -124,7 +135,7 @@ def process_ranking_analysis(stock_df: pd.DataFrame) -> list:
                 progress_bar.progress((i + 1) / total_stocks)
         
         if not any(not r.get('error') for r in results_list):
-            st.success("分析完成。沒有任何股票通過最終篩選條件。")
+            st.info("分析完成。沒有任何股票通過最終篩選條件。")
 
     except Exception as e:
         st.error(f"在篩選或分析過程中發生錯誤： {e}")
@@ -403,7 +414,7 @@ def display_ranking_results(market_type: str):
                     "漲跌幅(%)": stock_info.get('Change Percent', ''),
                     "預估量(張)": int(result.get('estimated_volume_lots', 0)),
                     "5日均量(張)": int(result.get('avg_vol_5_lots', 0)),
-                    "因子": float(f"{stock_info.get('Factor', 1.0):.2f}"), # 轉為浮點數方便處理
+                    "因子": round(stock_info.get('Factor', 1.0), 2),
                     "K": k_val,
                     "D": d_val,
                     "I訊號": i_text
@@ -466,7 +477,8 @@ def display_single_stock_analysis(stock_identifier: str):
     if not stock_code:
         st.error(f"找不到股票 '{stock_identifier}'。")
     else:
-        stock_name = twstock.codes[stock_code].name
+        stock_info = twstock.codes.get(stock_code)
+        stock_name = stock_info.name if stock_info else stock_code
         st.subheader(f"{stock_name} ({stock_code})")
         
         tab1, tab2, tab3 = st.tabs(["技術分析", "月營收趨勢", "大戶股權變化"])
