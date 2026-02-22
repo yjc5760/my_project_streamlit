@@ -3,11 +3,15 @@
 import streamlit as st
 import pandas as pd
 import os
+import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
 import twstock
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import plotly.graph_objects as go
+import plotly.express as px
+from plotly.subplots import make_subplots
 
 try:
     from scraper import scrape_goodinfo
@@ -147,6 +151,272 @@ def process_ranking_analysis(stock_df: pd.DataFrame) -> list:
 # Streamlit UI 介面佈局
 # --------------------------------------------------------------------------------
 
+def display_concentration_visualization(df: pd.DataFrame):
+    """
+    整合遠端 service-868047938877 的籌碼集中度視覺化到本地：
+    - 統計卡片（最高1日集中度、最高10日均量、股票總數）
+    - K/D 散佈圖（X=K值, Y=10日均量, 泡泡=1日集中度）
+    - 四象限分析（依 I 值分 4 圖, K值 vs 1日集中度）
+    - 個股集中度長條圖（依選擇顯示各周期集中度）
+    """
+    st.markdown("---")
+    st.subheader("📊 籌碼集中度視覺化分析")
+
+    viz_df = df.copy()
+
+    # --- 解析輔助欄位 ---
+    def parse_k(kd_str):
+        try:
+            m = re.search(r'K:([\d.]+)', str(kd_str))
+            return float(m.group(1)) if m else None
+        except Exception:
+            return None
+
+    def parse_d(kd_str):
+        try:
+            m = re.search(r'D:([\d.]+)', str(kd_str))
+            return float(m.group(1)) if m else None
+        except Exception:
+            return None
+
+    def parse_i(i_str):
+        try:
+            v = str(i_str).strip()
+            return float(v) if v not in ('N/A', '錯誤', 'nan', '') else None
+        except Exception:
+            return None
+
+    viz_df['_K'] = viz_df['KD'].apply(parse_k)
+    viz_df['_D'] = viz_df['KD'].apply(parse_d)
+    viz_df['_I'] = viz_df['I值'].apply(parse_i)
+
+    # 轉型數值欄位
+    conc_cols = ['1日集中度', '5日集中度', '10日集中度', '20日集中度', '60日集中度', '120日集中度']
+    vol_col = '10日均量'
+    name_col = '股票名稱' if '股票名稱' in viz_df.columns else '名稱'
+
+    for col in conc_cols + [vol_col]:
+        if col in viz_df.columns:
+            viz_df[col] = pd.to_numeric(viz_df[col], errors='coerce')
+
+    # --- 統計卡片 ---
+    c1, c2, c3 = st.columns(3)
+    c3.metric("📈 股票總數", len(viz_df))
+
+    if '1日集中度' in viz_df.columns and not viz_df['1日集中度'].isna().all():
+        best_idx = viz_df['1日集中度'].abs().idxmax()
+        c1.metric(
+            "最高 1日集中度",
+            viz_df.loc[best_idx, name_col],
+            f"{viz_df.loc[best_idx, '1日集中度']:.2f}%"
+        )
+
+    if vol_col in viz_df.columns and not viz_df[vol_col].isna().all():
+        vol_idx = viz_df[vol_col].idxmax()
+        c2.metric(
+            "最高 10日均量",
+            viz_df.loc[vol_idx, name_col],
+            f"{int(viz_df.loc[vol_idx, vol_col]):,} 張"
+        )
+
+    # --- Tabs ---
+    tab_defs = []
+    if viz_df['_K'].notna().any():
+        tab_defs.append(("📈 K/D 散佈圖", "kd"))
+    if '1日集中度' in viz_df.columns:
+        tab_defs.append(("🎯 四象限分析", "quad"))
+    tab_defs.append(("📊 個股集中度", "bar"))
+
+    if not tab_defs:
+        return
+
+    tabs = st.tabs([t[0] for t in tab_defs])
+
+    for tab, (_, tab_type) in zip(tabs, tab_defs):
+        with tab:
+
+            # ── K/D 散佈圖 ───────────────────────────────────
+            if tab_type == "kd":
+                sc = viz_df[viz_df['_K'].notna()].copy()
+
+                # 泡泡大小依 1日集中度絕對值縮放
+                if '1日集中度' in sc.columns and not sc['1日集中度'].isna().all():
+                    max_abs = sc['1日集中度'].abs().max()
+                    sc['_sz'] = (sc['1日集中度'].abs().fillna(0) / max_abs * 30 + 6).clip(6, 36)
+                else:
+                    sc['_sz'] = 12
+
+                i_colors = {-3: '#10b981', 1: '#3b82f6', 2: '#eab308', 3: '#ef4444'}
+                fig_kd = go.Figure()
+
+                for i_val, color in i_colors.items():
+                    sub = sc[sc['_I'] == i_val]
+                    if sub.empty:
+                        continue
+                    y_vals = sub[vol_col] if vol_col in sub.columns else pd.Series([0] * len(sub))
+                    fig_kd.add_trace(go.Scatter(
+                        x=sub['_K'],
+                        y=y_vals,
+                        mode='markers+text',
+                        name=f'I={i_val}',
+                        marker=dict(
+                            color=color, size=sub['_sz'].tolist(),
+                            opacity=0.75, line=dict(width=1, color='white')
+                        ),
+                        text=sub[name_col],
+                        textposition='top center',
+                        textfont=dict(size=9),
+                        hovertemplate=(
+                            '<b>%{text}</b><br>'
+                            'K值: %{x:.1f}<br>'
+                            '10日均量: %{y:,.0f} 張'
+                            '<extra></extra>'
+                        )
+                    ))
+
+                # 未分類
+                others = sc[~sc['_I'].isin([-3, 1, 2, 3])]
+                if not others.empty:
+                    y_vals = others[vol_col] if vol_col in others.columns else pd.Series([0] * len(others))
+                    fig_kd.add_trace(go.Scatter(
+                        x=others['_K'], y=y_vals,
+                        mode='markers', name='其他',
+                        marker=dict(color='#9ca3af', size=10, opacity=0.5),
+                        text=others[name_col],
+                        hovertemplate='<b>%{text}</b><br>K值: %{x:.1f}<extra></extra>'
+                    ))
+
+                # 參考線
+                fig_kd.add_vline(x=20, line_dash="dash", line_color="green", opacity=0.6,
+                                  annotation_text="超賣(20)", annotation_position="top right")
+                fig_kd.add_vline(x=80, line_dash="dash", line_color="red", opacity=0.6,
+                                  annotation_text="超買(80)", annotation_position="top left")
+
+                fig_kd.update_layout(
+                    title='K值 vs 10日均量（泡泡大小 = 1日集中度）',
+                    xaxis_title='K值 (0–100)',
+                    yaxis_title='10日均量 (張)',
+                    xaxis=dict(range=[0, 100]),
+                    height=520,
+                    legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1)
+                )
+                st.plotly_chart(fig_kd, use_container_width=True)
+
+            # ── 四象限分析 (2×2 subplots) ────────────────────
+            elif tab_type == "quad":
+                i_config = {
+                    -3: ("空頭下跌 (I=-3)", "#10b981"),
+                    1:  ("打底反轉 (I=1)",  "#3b82f6"),
+                    2:  ("盤整蓄積 (I=2)",  "#eab308"),
+                    3:  ("多頭上漲 (I=3)",  "#ef4444"),
+                }
+
+                sc2 = viz_df[viz_df['_K'].notna() & viz_df['1日集中度'].notna()].copy()
+                max_vol_g = sc2[vol_col].max() if vol_col in sc2.columns and not sc2[vol_col].isna().all() else 1
+
+                titles = [
+                    f"{name} ({len(sc2[sc2['_I']==i_val])}檔)"
+                    for i_val, (name, _) in i_config.items()
+                ]
+                fig_quad = make_subplots(
+                    rows=2, cols=2,
+                    subplot_titles=titles,
+                    vertical_spacing=0.14,
+                    horizontal_spacing=0.08
+                )
+
+                for (i_val, (name, color)), (row, col) in zip(
+                    i_config.items(), [(1, 1), (1, 2), (2, 1), (2, 2)]
+                ):
+                    sub = sc2[sc2['_I'] == i_val]
+                    if sub.empty:
+                        continue
+
+                    if vol_col in sub.columns and not sub[vol_col].isna().all():
+                        sizes = ((sub[vol_col].fillna(0) / max_vol_g * 30) + 6).tolist()
+                    else:
+                        sizes = 10
+
+                    fig_quad.add_trace(
+                        go.Scatter(
+                            x=sub['_K'],
+                            y=sub['1日集中度'],
+                            mode='markers+text',
+                            name=name,
+                            showlegend=False,
+                            marker=dict(
+                                color=color, size=sizes,
+                                opacity=0.75, line=dict(width=1, color='white')
+                            ),
+                            text=sub[name_col],
+                            textposition='top center',
+                            textfont=dict(size=8),
+                            hovertemplate=(
+                                '<b>%{text}</b><br>'
+                                'K值: %{x:.1f}<br>'
+                                '1日集中度: %{y:.2f}%'
+                                '<extra></extra>'
+                            )
+                        ),
+                        row=row, col=col
+                    )
+                    fig_quad.add_vline(x=50, line_dash="dot", line_color="gray",
+                                       opacity=0.3, row=row, col=col)
+                    fig_quad.add_hline(y=0, line_dash="dot", line_color="gray",
+                                       opacity=0.3, row=row, col=col)
+
+                fig_quad.update_xaxes(range=[0, 100], title_text='K值')
+                fig_quad.update_yaxes(title_text='1日集中度(%)')
+                fig_quad.update_layout(
+                    title='四象限分析：K值 vs 1日集中度（泡泡大小 = 10日均量）',
+                    height=720,
+                    showlegend=False
+                )
+                st.plotly_chart(fig_quad, use_container_width=True)
+
+            # ── 個股集中度長條圖 ─────────────────────────────
+            elif tab_type == "bar":
+                avail_conc = [c for c in conc_cols if c in viz_df.columns]
+                if not avail_conc:
+                    st.warning("找不到集中度欄位。")
+                else:
+                    labels_map = {
+                        '1日集中度': '1日', '5日集中度': '5日',
+                        '10日集中度': '10日', '20日集中度': '20日',
+                        '60日集中度': '60日', '120日集中度': '120日'
+                    }
+                    stock_labels = [
+                        f"{row[name_col]}({row['代碼']})"
+                        for _, row in viz_df.iterrows()
+                    ]
+                    selected = st.selectbox("選擇股票", stock_labels, key="conc_bar_select")
+
+                    if selected:
+                        idx = stock_labels.index(selected)
+                        row = viz_df.iloc[idx]
+                        vals = [float(row[c]) if pd.notna(row.get(c)) else None for c in avail_conc]
+                        x_labels = [labels_map.get(c, c) for c in avail_conc]
+                        bar_colors = [
+                            'crimson' if (v is not None and v > 0) else 'seagreen'
+                            for v in vals
+                        ]
+                        fig_bar = go.Figure(go.Bar(
+                            x=x_labels,
+                            y=vals,
+                            marker_color=bar_colors,
+                            text=[f"{v:.2f}%" if v is not None else "N/A" for v in vals],
+                            textposition='outside'
+                        ))
+                        fig_bar.add_hline(y=0, line_color="gray", opacity=0.5)
+                        fig_bar.update_layout(
+                            title=f'{row[name_col]}（{row["代碼"]}）— 各週期籌碼集中度',
+                            xaxis_title='時間週期',
+                            yaxis_title='集中度 (%)',
+                            height=420
+                        )
+                        st.plotly_chart(fig_bar, use_container_width=True)
+
+
 def display_concentration_results():
     st.header("📊 1日籌碼集中度選股結果")
     with st.spinner("正在獲取並篩選籌碼集中度資料..."):
@@ -203,7 +473,12 @@ def display_concentration_results():
                 ]
                 final_display_columns = [col for col in display_columns if col in filtered_stocks.columns]
                 st.dataframe(filtered_stocks[final_display_columns])
-                
+
+                # ── 整合遠端視覺化服務：直接在本地產生統計卡片與圖表 ──
+                display_concentration_visualization(filtered_stocks)
+
+                st.markdown("---")
+                st.subheader("🔍 個股技術分析圖")
                 for _, stock in filtered_stocks.iterrows():
                     stock_code = str(stock['代碼'])
                     stock_name = stock['股票名稱']
@@ -299,6 +574,235 @@ def display_goodinfo_results():
         st.warning("未爬取到任何資料。請檢查 Cookie 是否有效。")
 
 
+def display_monthly_revenue_visualization(df: pd.DataFrame):
+    """
+    整合遠端視覺化服務功能到本地：
+    - 統計指標卡片
+    - 年增率 / 月增率 Top 10 柱狀圖
+    - K值 vs 年增率 四象限散佈圖 (依 I 值分類)
+    """
+
+    st.markdown("---")
+    st.subheader("📊 月營收視覺化分析")
+
+    viz_df = df.copy()
+
+    # --- 解析 K 值 (從 "K:XX.XX D:XX.XX" 格式) ---
+    def parse_k(kd_str):
+        try:
+            m = re.search(r'K:([\d.]+)', str(kd_str))
+            return float(m.group(1)) if m else None
+        except Exception:
+            return None
+
+    # --- 解析 I 值 ---
+    def parse_i(i_str):
+        try:
+            v = str(i_str).strip()
+            return float(v) if v not in ('N/A', '錯誤', 'nan', '') else None
+        except Exception:
+            return None
+
+    viz_df['_K值'] = viz_df['KD'].apply(parse_k)
+    viz_df['_I值'] = viz_df['I值'].apply(parse_i)
+
+    # --- 自動偵測年增率、月增率、成交量欄位 ---
+    yoy_col = None
+    mom_col = None
+    vol_col = None
+
+    for col in viz_df.columns:
+        c = col.replace(' ', '').replace('\xa0', '')
+        if yoy_col is None and any(k in c for k in ['年增率', '年增', 'YoY', 'yoy']):
+            yoy_col = col
+        elif mom_col is None and any(k in c for k in ['月增率', '月增', 'MoM', 'mom']):
+            mom_col = col
+        if vol_col is None and any(k in c for k in ['成交張數', '張數', '量(張)', '成交量']):
+            vol_col = col
+
+    # 轉型為數值
+    for col in [yoy_col, mom_col, vol_col]:
+        if col:
+            viz_df[col] = pd.to_numeric(viz_df[col], errors='coerce')
+
+    # --- 依成交量篩選 (> 5000 張，與遠端服務相同邏輯) ---
+    if vol_col and not viz_df[vol_col].isna().all():
+        viz_filtered = viz_df[viz_df[vol_col] > 5000].copy()
+    else:
+        viz_filtered = viz_df.copy()
+
+    n = len(viz_filtered)
+
+    # --- 統計指標卡片 ---
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("📈 分析股票數", n)
+
+    if yoy_col and n > 0 and not viz_filtered[yoy_col].isna().all():
+        avg_yoy = viz_filtered[yoy_col].mean()
+        c2.metric("平均年增率", f"{avg_yoy:.1f}%")
+        best_idx = viz_filtered[yoy_col].idxmax()
+        c4.metric("最高年增率", viz_filtered.loc[best_idx, '名稱'])
+
+    if mom_col and n > 0 and not viz_filtered[mom_col].isna().all():
+        avg_mom = viz_filtered[mom_col].mean()
+        c3.metric("平均月增率", f"{avg_mom:.1f}%")
+
+    # --- 若未偵測到關鍵欄位，顯示可用欄位清單並返回 ---
+    if not yoy_col and not mom_col:
+        skip_cols = {'代碼', '名稱', 'KD', 'I值', '_K值', '_I值'}
+        available = [c for c in viz_df.columns if c not in skip_cols]
+        st.warning(
+            f"⚠️ 未偵測到年增率／月增率欄位，無法繪製圖表。\n\n"
+            f"可用欄位：`{'`、`'.join(available[:20])}`"
+        )
+        return
+
+    # --- 決定要顯示哪些 Tab ---
+    tab_defs = []
+    if yoy_col and n > 0 and not viz_filtered[yoy_col].isna().all():
+        tab_defs.append(("📊 年增率 Top10", "yoy"))
+    if mom_col and n > 0 and not viz_filtered[mom_col].isna().all():
+        tab_defs.append(("📊 月增率 Top10", "mom"))
+    if viz_filtered['_K值'].notna().any() and yoy_col:
+        tab_defs.append(("🎯 四象限分析", "quad"))
+
+    if not tab_defs:
+        return
+
+    tabs = st.tabs([t[0] for t in tab_defs])
+
+    for tab, (_, tab_type) in zip(tabs, tab_defs):
+        with tab:
+
+            # ── 年增率 Top10 ──────────────────────────────
+            if tab_type == "yoy":
+                top10 = viz_filtered.nlargest(10, yoy_col)[['名稱', '代碼', yoy_col]].copy()
+                top10['股票'] = top10['名稱'] + '\n(' + top10['代碼'].astype(str) + ')'
+                fig = px.bar(
+                    top10, x='股票', y=yoy_col,
+                    title='月營收年增率 Top 10',
+                    labels={yoy_col: '年增率(%)'},
+                    color=yoy_col,
+                    color_continuous_scale='RdYlGn',
+                    text=top10[yoy_col].round(1).astype(str) + '%'
+                )
+                fig.update_traces(textposition='outside')
+                fig.update_layout(xaxis_tickangle=-30, showlegend=False)
+                st.plotly_chart(fig, use_container_width=True)
+
+            # ── 月增率 Top10 ──────────────────────────────
+            elif tab_type == "mom":
+                top10m = viz_filtered.nlargest(10, mom_col)[['名稱', '代碼', mom_col]].copy()
+                top10m['股票'] = top10m['名稱'] + '\n(' + top10m['代碼'].astype(str) + ')'
+                fig_m = px.bar(
+                    top10m, x='股票', y=mom_col,
+                    title='月營收月增率 Top 10',
+                    labels={mom_col: '月增率(%)'},
+                    color=mom_col,
+                    color_continuous_scale='RdYlGn',
+                    text=top10m[mom_col].round(1).astype(str) + '%'
+                )
+                fig_m.update_traces(textposition='outside')
+                fig_m.update_layout(xaxis_tickangle=-30, showlegend=False)
+                st.plotly_chart(fig_m, use_container_width=True)
+
+            # ── K值 vs 年增率 四象限分析 ──────────────────
+            elif tab_type == "quad":
+                # I 值分類設定 (與遠端服務相同)
+                i_config = {
+                    -3: ("優質股 (I=-3)", "#10b981"),
+                    1:  ("反轉股 (I=1)",  "#3b82f6"),
+                    2:  ("成長股 (I=2)",  "#eab308"),
+                    3:  ("高風險 (I=3)",  "#ef4444"),
+                }
+
+                scatter_df = viz_filtered[
+                    viz_filtered['_K值'].notna() & viz_filtered[yoy_col].notna()
+                ].copy()
+
+                fig_q = go.Figure()
+
+                for i_val, (name, color) in i_config.items():
+                    sub = scatter_df[scatter_df['_I值'] == i_val]
+                    if sub.empty:
+                        continue
+
+                    # 泡泡大小依成交量等比縮放
+                    if vol_col and vol_col in sub.columns and not sub[vol_col].isna().all():
+                        max_vol = scatter_df[vol_col].max()
+                        sizes = ((sub[vol_col].fillna(0) / max_vol * 35) + 8).tolist()
+                    else:
+                        sizes = 14
+
+                    fig_q.add_trace(go.Scatter(
+                        x=sub['_K值'],
+                        y=sub[yoy_col],
+                        mode='markers+text',
+                        name=name,
+                        marker=dict(
+                            color=color, size=sizes, opacity=0.75,
+                            line=dict(width=1, color='white')
+                        ),
+                        text=sub['名稱'],
+                        textposition='top center',
+                        textfont=dict(size=9),
+                        hovertemplate=(
+                            '<b>%{text}</b><br>'
+                            'K值: %{x:.1f}<br>'
+                            '年增率: %{y:.1f}%'
+                            '<extra></extra>'
+                        )
+                    ))
+
+                # 未分類股票（I值不在 {-3,1,2,3}）
+                others = scatter_df[~scatter_df['_I值'].isin([-3, 1, 2, 3])]
+                if not others.empty:
+                    fig_q.add_trace(go.Scatter(
+                        x=others['_K值'],
+                        y=others[yoy_col],
+                        mode='markers',
+                        name='其他',
+                        marker=dict(color='#9ca3af', size=12, opacity=0.5),
+                        text=others['名稱'],
+                        hovertemplate=(
+                            '<b>%{text}</b><br>'
+                            'K值: %{x:.1f}<br>'
+                            '年增率: %{y:.1f}%'
+                            '<extra></extra>'
+                        )
+                    ))
+
+                # 中心分隔軸線
+                fig_q.add_hline(y=0,  line_dash="dash", line_color="gray", opacity=0.4)
+                fig_q.add_vline(x=50, line_dash="dash", line_color="gray", opacity=0.4)
+
+                # 象限文字標籤
+                if not scatter_df.empty:
+                    y_max = scatter_df[yoy_col].max()
+                    y_label = y_max * 0.88 if y_max > 0 else 10
+                    for x_pos, label in [(22, "低K高增率<br>(潛力強勢)"), (78, "高K高增率<br>(強勢持續)")]:
+                        fig_q.add_annotation(
+                            x=x_pos, y=y_label, text=label,
+                            showarrow=False,
+                            font=dict(color="gray", size=10),
+                            opacity=0.6
+                        )
+
+                fig_q.update_layout(
+                    title='K值 vs 月營收年增率 四象限分析（泡泡大小 = 成交量）',
+                    xaxis_title='K值 (0–100)',
+                    yaxis_title='年增率 (%)',
+                    xaxis=dict(range=[0, 100]),
+                    height=620,
+                    legend=dict(
+                        orientation='h',
+                        yanchor='bottom', y=1.02,
+                        xanchor='right',  x=1
+                    )
+                )
+                st.plotly_chart(fig_q, use_container_width=True)
+
+
 def display_monthly_revenue_results():
     st.header("📈 月營收強勢股 (from Goodinfo)")
     with st.spinner("正在從 Goodinfo! 網站爬取月營收資料..."):
@@ -365,6 +869,11 @@ def display_monthly_revenue_results():
         
         st.dataframe(scraped_df)
 
+        # ── 整合遠端視覺化服務：直接在本地產生統計卡片與圖表 ──
+        display_monthly_revenue_visualization(scraped_df)
+
+        st.markdown("---")
+        st.subheader("🔍 個股技術分析圖")
         for _, stock in scraped_df.iterrows():
             stock_code = str(stock['代碼']).strip()
             stock_name = str(stock['名稱']).strip()
@@ -378,6 +887,243 @@ def display_monthly_revenue_results():
                     st.error(f"為 {stock_name} 生成圖表時出錯: {analysis_result.get('message', '未知錯誤')}")
     else:
         st.warning("未爬取到任何月營收資料。請檢查 Cookie 是否有效。")
+
+
+def display_ranking_visualization(summary_df: pd.DataFrame):
+    """
+    整合遠端 stock-trend-analyzer 的漲幅排行視覺化到本地：
+    - 統計卡片（最佳漲幅、最高量比、超賣數、強訊號數）
+    - 量比 Top15 水平柱狀圖
+    - K值 vs 漲跌幅% 散佈圖（依 I 訊號分色，泡泡=量比）
+    - I 訊號四象限分析（2×2 子圖）
+    """
+    st.markdown("---")
+    st.subheader("📊 漲幅排行視覺化分析")
+
+    viz_df = summary_df.copy()
+
+    # --- 數值轉型 ---
+    for col in ['K', 'D', '因子', '漲跌幅(%)', '成交價', '預估量(張)', '5日均量(張)']:
+        if col in viz_df.columns:
+            viz_df[col] = pd.to_numeric(viz_df[col], errors='coerce')
+
+    def parse_i(v):
+        try:
+            return float(str(v).strip()) if str(v).strip() not in ('N/A', '錯誤', 'nan', '') else None
+        except Exception:
+            return None
+
+    viz_df['_I'] = viz_df['I訊號'].apply(parse_i)
+
+    # 量比：直接用 預估量÷5日均量 計算，避免「因子」欄位預設值 1.0 導致泡泡等大
+    if '預估量(張)' in viz_df.columns and '5日均量(張)' in viz_df.columns:
+        viz_df['_量比'] = (
+            viz_df['預估量(張)'] / viz_df['5日均量(張)'].replace(0, np.nan)
+        ).round(2)
+    else:
+        viz_df['_量比'] = viz_df['因子']
+
+    # --- 統計卡片 ---
+    c1, c2, c3, c4 = st.columns(4)
+
+    if '漲跌幅(%)' in viz_df.columns and not viz_df['漲跌幅(%)'].isna().all():
+        top_idx = viz_df['漲跌幅(%)'].idxmax()
+        c1.metric("🏆 最佳漲幅",
+                  viz_df.loc[top_idx, '名稱'],
+                  f"+{viz_df.loc[top_idx, '漲跌幅(%)']:.2f}%")
+
+    if '_量比' in viz_df.columns and not viz_df['_量比'].isna().all():
+        vol_idx = viz_df['_量比'].idxmax()
+        c2.metric("📦 最高量比",
+                  viz_df.loc[vol_idx, '名稱'],
+                  f"{viz_df.loc[vol_idx, '_量比']:.1f}x")
+
+    if 'K' in viz_df.columns:
+        oversold = int((viz_df['K'] < 20).sum())
+        c3.metric("🟢 超賣股數 (K<20)", oversold)
+
+    strong = int((viz_df['_I'] == 3).sum())
+    c4.metric("🔴 強訊號 (I=3)", strong)
+
+    # --- Tabs ---
+    tabs = st.tabs(["📊 量比 Top15", "📈 K值 vs 漲跌幅%", "🎯 四象限分析"])
+
+    # ── 量比 Top15 水平柱狀圖 ─────────────────────────────
+    with tabs[0]:
+        if '_量比' not in viz_df.columns or viz_df['_量比'].isna().all():
+            st.warning("找不到量比欄位。")
+        else:
+            top15 = viz_df.nlargest(15, '_量比')[['名稱', '代碼', '_量比', '漲跌幅(%)']].copy()
+            top15['股票'] = top15['名稱'] + '(' + top15['代碼'].astype(str) + ')'
+            top15 = top15.sort_values('_量比')   # 水平圖由小到大排列更直覺
+
+            fig_bar = go.Figure(go.Bar(
+                x=top15['_量比'],
+                y=top15['股票'],
+                orientation='h',
+                marker_color='#3b82f6',
+                text=top15['_量比'].round(1).astype(str) + 'x',
+                textposition='outside'
+            ))
+            x_max = top15['_量比'].max() * 1.15 if not top15['_量比'].isna().all() else 10
+            fig_bar.update_layout(
+                title='量比 Top 15（預估量 / 5日均量）',
+                xaxis_title='量比',
+                yaxis_title='',
+                xaxis=dict(range=[1, x_max]),
+                height=max(400, len(top15) * 28 + 80),
+                margin=dict(l=140)
+            )
+            st.plotly_chart(fig_bar, use_container_width=True)
+
+    # ── K值 vs 漲跌幅% 散佈圖 ────────────────────────────
+    with tabs[1]:
+        sc = viz_df[viz_df['K'].notna() & viz_df['漲跌幅(%)'].notna()].copy()
+        if sc.empty:
+            st.warning("無有效 K 值資料。")
+        else:
+            # 泡泡大小依量比縮放（使用重新計算的 _量比，非預設 因子）
+            if '_量比' in sc.columns and not sc['_量比'].isna().all():
+                max_f = sc['_量比'].max()
+                sc['_sz'] = ((sc['_量比'].fillna(0) / max_f * 32) + 6).clip(6, 38)
+            else:
+                sc['_sz'] = 14
+
+            # I 訊號分色（與遠端服務相同）
+            i_color_map = {
+                -3: ('#10b981', '空頭強力 (I=-3)'),
+                -2: ('#6ee7b7', '空頭弱 (I=-2)'),
+                -1: ('#6ee7b7', '空頭弱 (I=-1)'),
+                 0: ('#fbbf24', '中性 (I=0)'),
+                 1: ('#fca5a5', '多頭弱 (I=1)'),
+                 2: ('#fca5a5', '多頭弱 (I=2)'),
+                 3: ('#ef4444', '多頭強力 (I=3)'),
+            }
+
+            fig_sc = go.Figure()
+            plotted = set()
+            for i_val, (color, label) in i_color_map.items():
+                sub = sc[sc['_I'] == i_val]
+                if sub.empty:
+                    continue
+                show = label not in plotted
+                plotted.add(label)
+                fig_sc.add_trace(go.Scatter(
+                    x=sub['K'],
+                    y=sub['漲跌幅(%)'],
+                    mode='markers+text',
+                    name=label,
+                    showlegend=show,
+                    marker=dict(color=color, size=sub['_sz'].tolist(),
+                                opacity=0.8, line=dict(width=1, color='white')),
+                    text=sub['名稱'],
+                    textposition='top center',
+                    textfont=dict(size=9),
+                    hovertemplate=(
+                        '<b>%{text}</b><br>'
+                        'K值: %{x:.1f}<br>'
+                        '漲跌幅: %{y:.2f}%'
+                        '<extra></extra>'
+                    )
+                ))
+
+            others = sc[~sc['_I'].isin(i_color_map.keys())]
+            if not others.empty:
+                fig_sc.add_trace(go.Scatter(
+                    x=others['K'], y=others['漲跌幅(%)'],
+                    mode='markers', name='其他',
+                    marker=dict(color='#9ca3af', size=12, opacity=0.5),
+                    text=others['名稱'],
+                    hovertemplate='<b>%{text}</b><br>K: %{x:.1f}<br>漲跌幅: %{y:.2f}%<extra></extra>'
+                ))
+
+            fig_sc.add_vline(x=20, line_dash="dash", line_color="#10b981", opacity=0.6,
+                             annotation_text="超賣(20)", annotation_position="top right")
+            fig_sc.add_vline(x=80, line_dash="dash", line_color="#ef4444", opacity=0.6,
+                             annotation_text="超買(80)", annotation_position="top left")
+
+            fig_sc.update_layout(
+                title='K值 vs 漲跌幅%（泡泡大小 = 量比）',
+                xaxis_title='K值 (0–100)',
+                yaxis_title='漲跌幅 (%)',
+                xaxis=dict(range=[0, 100]),
+                height=530,
+                legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1)
+            )
+            st.plotly_chart(fig_sc, use_container_width=True)
+
+    # ── I 訊號四象限 (2×2 subplots) ─────────────────────
+    with tabs[2]:
+        i_quad_config = {
+            -3: ("空頭強力 (I=-3)", "#10b981"),
+             1: ("多頭弱 (I=1)",   "#fca5a5"),
+             2: ("多頭中 (I=2)",   "#f97316"),
+             3: ("多頭強力 (I=3)", "#ef4444"),
+        }
+        sc2 = viz_df[viz_df['K'].notna() & viz_df['漲跌幅(%)'].notna()].copy()
+
+        if sc2.empty:
+            st.warning("無有效資料可繪製四象限圖。")
+        else:
+            max_f2 = sc2['_量比'].max() if '_量比' in sc2.columns and not sc2['_量比'].isna().all() else 1
+
+            titles = [
+                f"{name} ({len(sc2[sc2['_I']==i_val])}檔)"
+                for i_val, (name, _) in i_quad_config.items()
+            ]
+            fig_q = make_subplots(
+                rows=2, cols=2,
+                subplot_titles=titles,
+                vertical_spacing=0.14,
+                horizontal_spacing=0.08
+            )
+
+            for (i_val, (name, color)), (row, col) in zip(
+                i_quad_config.items(), [(1, 1), (1, 2), (2, 1), (2, 2)]
+            ):
+                sub = sc2[sc2['_I'] == i_val]
+                if sub.empty:
+                    continue
+
+                if '_量比' in sub.columns and not sub['_量比'].isna().all():
+                    sizes = ((sub['_量比'].fillna(0) / max_f2 * 30) + 6).tolist()
+                else:
+                    sizes = 10
+
+                fig_q.add_trace(
+                    go.Scatter(
+                        x=sub['K'],
+                        y=sub['漲跌幅(%)'],
+                        mode='markers+text',
+                        name=name,
+                        showlegend=False,
+                        marker=dict(color=color, size=sizes,
+                                    opacity=0.8, line=dict(width=1, color='white')),
+                        text=sub['名稱'],
+                        textposition='top center',
+                        textfont=dict(size=8),
+                        hovertemplate=(
+                            '<b>%{text}</b><br>'
+                            'K值: %{x:.1f}<br>'
+                            '漲跌幅: %{y:.2f}%'
+                            '<extra></extra>'
+                        )
+                    ),
+                    row=row, col=col
+                )
+                fig_q.add_vline(x=50, line_dash="dot", line_color="gray",
+                                opacity=0.3, row=row, col=col)
+                fig_q.add_hline(y=0, line_dash="dot", line_color="gray",
+                                opacity=0.3, row=row, col=col)
+
+            fig_q.update_xaxes(range=[0, 100], title_text='K值')
+            fig_q.update_yaxes(title_text='漲跌幅(%)')
+            fig_q.update_layout(
+                title='四象限分析：K值 vs 漲跌幅%（泡泡大小 = 量比）',
+                height=720,
+                showlegend=False
+            )
+            st.plotly_chart(fig_q, use_container_width=True)
 
 
 def display_ranking_results(market_type: str):
@@ -445,7 +1191,7 @@ def display_ranking_results(market_type: str):
             # 使用 st.dataframe 顯示，這樣滑鼠移上去時右上角會出現 CSV 下載按鈕
             # 並且使用 column_config 來格式化數字 (例如不顯示逗號或指定精度)
             st.dataframe(
-                styled_df, 
+                styled_df,
                 use_container_width=True,
                 column_config={
                     "排名": st.column_config.NumberColumn(format="%d"),
@@ -457,7 +1203,11 @@ def display_ranking_results(market_type: str):
                 }
             )
 
-        st.subheader("個股分析圖表")
+            # ── 整合遠端視覺化服務：直接在本地產生統計卡片與圖表 ──
+            display_ranking_visualization(summary_df)
+
+        st.markdown("---")
+        st.subheader("🔍 個股技術分析圖")
         for result in yahoo_results:
             if not result.get('error'):
                 stock_name = result['stock_info']['Stock Name']
