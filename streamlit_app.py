@@ -606,16 +606,33 @@ def display_monthly_revenue_visualization(df: pd.DataFrame):
     viz_df['_K值'] = viz_df['KD'].apply(parse_k)
     viz_df['_I值'] = viz_df['I值'].apply(parse_i)
 
-    # --- 自動偵測年增率、月增率、成交量欄位 ---
+    # --- 終極精準版：年增與月增都強制要求包含 '%' 符號，並排除干擾欄位 ---
     yoy_col = None
     mom_col = None
     vol_col = None
 
     for col in viz_df.columns:
+        # 去除空白字元以便精準比對
         c = col.replace(' ', '').replace('\xa0', '')
-        if yoy_col is None and any(k in c for k in ['年增率', '年增', 'YoY', 'yoy']):
+        
+        # 找年增：必須有「年增」+ 必須有「%」+ 排除「累計」+ 排除「前X月」
+        if yoy_col is None and '年增' in c and '%' in c and '累計' not in c and '前' not in c:
             yoy_col = col
-        elif mom_col is None and any(k in c for k in ['月增率', '月增', 'MoM', 'mom']):
+            
+        # 找月增：必須有「月增」+ 必須有「%」+ 排除「累計」+ 排除「前X月」
+        elif mom_col is None and '月增' in c and '%' in c and '累計' not in c and '前' not in c:
+            mom_col = col
+            
+        # 找成交量：優先找明確的成交張數
+        elif vol_col is None and any(k in c for k in ['成交張數', '單日張數', '成交量']):
+            vol_col = col
+
+    # 若精準比對失敗，才退回寬鬆的備用機制 (以防網站哪天把 % 拿掉)
+    for col in viz_df.columns:
+        c = col.replace(' ', '').replace('\xa0', '')
+        if yoy_col is None and any(k in c for k in ['YoY', 'yoy']):
+            yoy_col = col
+        if mom_col is None and any(k in c for k in ['MoM', 'mom']):
             mom_col = col
         if vol_col is None and any(k in c for k in ['成交張數', '張數', '量(張)', '成交量']):
             vol_col = col
