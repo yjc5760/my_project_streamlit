@@ -4,6 +4,7 @@ streamlit_app.py - 台股分析儀
 整合月營收選股、個股分析、集中度等功能。
 已更新為使用 utils.py 共用模組。
 """
+from __future__ import annotations
 import streamlit as st
 import pandas as pd
 import os
@@ -25,7 +26,7 @@ try:
     from stock_information_plot import plot_stock_revenue_trend, plot_stock_major_shareholders
     from concentration_1day import fetch_stock_concentration_data, filter_stock_data
 
-except ImportError as e:
+except (ImportError, TypeError, SyntaxError) as e:
     st.error(f"無法導入必要的模組。請確認所有 .py 檔案都位於同一個資料夾中。")
     st.error(f"詳細錯誤： {e}")
     st.stop()
