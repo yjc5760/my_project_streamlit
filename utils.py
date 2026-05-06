@@ -3,6 +3,7 @@ utils.py
 共用工具模組：HTTP session 建立、fetch_html、retry 機制、get_stock_code
 """
 
+from __future__ import annotations
 import os
 import sys
 import platform
