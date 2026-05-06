@@ -134,60 +134,60 @@ def plot_stock_revenue_trend(stock_identifier):
             response.raise_for_status()
             response.encoding = 'utf-8'
 
-        dfs = pd.read_html(StringIO(response.text), flavor='lxml')
-        if not dfs:
-                        print(f"找不到 {stock_code} 的月營收資料")
-                        return None
+            dfs = pd.read_html(StringIO(response.text), flavor='lxml')
+            if not dfs:
+                            print(f"找不到 {stock_code} 的月營收資料")
+                            return None
 
-        # 尋找包含年度/月份資訊的表格
-        df = None
-        for d in dfs:
-                        cols = d.columns.get_level_values(-1) if isinstance(d.columns, pd.MultiIndex) else d.columns
-                        cols_str = ' '.join(str(c) for c in cols)
-                        if '月' in cols_str or '營收' in cols_str or '年' in cols_str:
-                                            df = d
-                                            break
+            # 尋找包含年度/月份資訊的表格
+            df = None
+            for d in dfs:
+                            cols = d.columns.get_level_values(-1) if isinstance(d.columns, pd.MultiIndex) else d.columns
+                            cols_str = ' '.join(str(c) for c in cols)
+                            if '月' in cols_str or '營收' in cols_str or '年' in cols_str:
+                                                df = d
+                                                break
 
-                    if df is None:
-                                    df = dfs[0]
+            if df is None:
+                            df = dfs[0]
 
-        if isinstance(df.columns, pd.MultiIndex):
-                        df.columns = df.columns.get_level_values(-1)
+            if isinstance(df.columns, pd.MultiIndex):
+                            df.columns = df.columns.get_level_values(-1)
 
-        df.columns = df.columns.astype(str).str.replace(r'\s+', '', regex=True)
+            df.columns = df.columns.astype(str).str.replace(r'\s+', '', regex=True)
 
-        # 尋找年份欄和數值欄
-        year_col = next((c for c in df.columns if '年' in c or 'year' in c.lower()), None)
-        revenue_cols = [
-                        c for c in df.columns
-                        if c not in ([year_col] if year_col else [])
-                        and pd.to_numeric(df[c], errors='coerce').notna().sum() > 0
-        ]
+            # 尋找年份欄和數值欄
+            year_col = next((c for c in df.columns if '年' in c or 'year' in c.lower()), None)
+            revenue_cols = [
+                            c for c in df.columns
+                            if c not in ([year_col] if year_col else [])
+                            and pd.to_numeric(df[c], errors='coerce').notna().sum() > 0
+            ]
 
-        if not year_col or not revenue_cols:
-                        print(f"無法識別 {stock_code} 月營收資料的欄位: {df.columns.tolist()}")
-                        return None
+            if not year_col or not revenue_cols:
+                            print(f"無法識別 {stock_code} 月營收資料的欄位: {df.columns.tolist()}")
+                            return None
 
-        stock_info = twstock.codes.get(stock_code)
-        stock_name = stock_info.name if stock_info else stock_code
+            stock_info = twstock.codes.get(stock_code)
+            stock_name = stock_info.name if stock_info else stock_code
 
-        fig = make_subplots(specs=[[{"secondary_y": False}]])
-        for col in revenue_cols[:12]:  # 最多顯示 12 個月
-                        y_data = pd.to_numeric(df[col], errors='coerce')
-                        fig.add_trace(go.Bar(
-                            name=col,
-                            x=df[year_col].astype(str),
-                            y=y_data,
-                        ))
+            fig = make_subplots(specs=[[{"secondary_y": False}]])
+            for col in revenue_cols[:12]:  # 最多顯示 12 個月
+                            y_data = pd.to_numeric(df[col], errors='coerce')
+                            fig.add_trace(go.Bar(
+                                name=col,
+                                x=df[year_col].astype(str),
+                                y=y_data,
+                            ))
 
-        fig.update_layout(
-                        title=f'{stock_name} ({stock_code}) 月營收趨勢',
-                        xaxis_title='年份',
-                        yaxis_title='營收 (千元)',
-                        barmode='group',
-                        height=500,
-        )
-        return fig
+            fig.update_layout(
+                            title=f'{stock_name} ({stock_code}) 月營收趨勢',
+                            xaxis_title='年份',
+                            yaxis_title='營收 (千元)',
+                            barmode='group',
+                            height=500,
+            )
+            return fig
 
         except Exception as e:
             print(f"繪製 {stock_code} 月營收圖時發生錯誤: {e}")
