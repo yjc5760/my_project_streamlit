@@ -49,54 +49,54 @@ def plot_stock_major_shareholders(stock_identifier):
             response.encoding = 'utf-8'
             soup = BeautifulSoup(response.text, 'html.parser')
 
-        table = soup.find('table', {'id': 'tblStockHolder'})
-        if table is None:
-                        print(f"找不到 {stock_code} 的股東資料表格")
-                        return None
-
-        dfs = pd.read_html(StringIO(str(table)))
-        if not dfs:
-                        return None
-
-        df = dfs[0]
-        if isinstance(df.columns, pd.MultiIndex):
-                        df.columns = df.columns.get_level_values(-1)
-
-        df.columns = df.columns.astype(str).str.replace(r'\s+', '', regex=True)
-
-        holder_col = next((c for c in df.columns if '股東' in c or '名稱' in c), None)
-        ratio_col = next((c for c in df.columns if '持股' in c or '比例' in c or '%' in c), None)
-
-        if not holder_col or not ratio_col:
-                        print(f"無法識別 {stock_code} 股東資料的欄位: {df.columns.tolist()}")
-                        return None
-
-        df_plot = df[[holder_col, ratio_col]].copy()
-        df_plot[ratio_col] = pd.to_numeric(df_plot[ratio_col], errors='coerce')
-        df_plot = df_plot.dropna(subset=[ratio_col]).head(15)
-
-        if df_plot.empty:
-                        return None
-
-        stock_info = twstock.codes.get(stock_code)
-        stock_name = stock_info.name if stock_info else stock_code
-
-        fig = go.Figure(go.Bar(
-                        x=df_plot[ratio_col],
-                        y=df_plot[holder_col],
-                        orientation='h',
-                        marker_color='steelblue',
-                        text=df_plot[ratio_col].apply(lambda x: f'{x:.2f}%'),
-                        textposition='outside',
-        ))
-        fig.update_layout(
-                        title=f'{stock_name} ({stock_code}) 主要股東持股比例',
-                        xaxis_title='持股比例 (%)',
-                        yaxis=dict(autorange='reversed'),
-                        height=500,
-                        margin=dict(l=200, r=50, t=60, b=50),
-        )
-        return fig
+            table = soup.find('table', {'id': 'tblStockHolder'})
+            if table is None:
+                            print(f"找不到 {stock_code} 的股東資料表格")
+                            return None
+    
+            dfs = pd.read_html(StringIO(str(table)))
+            if not dfs:
+                            return None
+    
+            df = dfs[0]
+            if isinstance(df.columns, pd.MultiIndex):
+                            df.columns = df.columns.get_level_values(-1)
+    
+            df.columns = df.columns.astype(str).str.replace(r'\s+', '', regex=True)
+    
+            holder_col = next((c for c in df.columns if '股東' in c or '名稱' in c), None)
+            ratio_col = next((c for c in df.columns if '持股' in c or '比例' in c or '%' in c), None)
+    
+            if not holder_col or not ratio_col:
+                            print(f"無法識別 {stock_code} 股東資料的欄位: {df.columns.tolist()}")
+                            return None
+    
+            df_plot = df[[holder_col, ratio_col]].copy()
+            df_plot[ratio_col] = pd.to_numeric(df_plot[ratio_col], errors='coerce')
+            df_plot = df_plot.dropna(subset=[ratio_col]).head(15)
+    
+            if df_plot.empty:
+                            return None
+    
+            stock_info = twstock.codes.get(stock_code)
+            stock_name = stock_info.name if stock_info else stock_code
+    
+            fig = go.Figure(go.Bar(
+                            x=df_plot[ratio_col],
+                            y=df_plot[holder_col],
+                            orientation='h',
+                            marker_color='steelblue',
+                            text=df_plot[ratio_col].apply(lambda x: f'{x:.2f}%'),
+                            textposition='outside',
+            ))
+            fig.update_layout(
+                            title=f'{stock_name} ({stock_code}) 主要股東持股比例',
+                            xaxis_title='持股比例 (%)',
+                            yaxis=dict(autorange='reversed'),
+                            height=500,
+                            margin=dict(l=200, r=50, t=60, b=50),
+            )
+            return fig
 
         except Exception as e:
             print(f"繪製 {stock_code} 股東圖時發生錯誤: {e}")
