@@ -39,15 +39,15 @@ def plot_stock_major_shareholders(stock_identifier):
             "Referer": "https://goodinfo.tw/",
         }
 
-    cookie = os.getenv('GOODINFO_COOKIE_MY_STOCK', '')
-    if cookie:
-                headers["Cookie"] = cookie
+        cookie = os.getenv('GOODINFO_COOKIE_MY_STOCK', '')
+        if cookie:
+            headers["Cookie"] = cookie
 
-    try:
-                response = requests.get(url, headers=headers, timeout=15)
-                response.raise_for_status()
-                response.encoding = 'utf-8'
-                soup = BeautifulSoup(response.text, 'html.parser')
+        try:
+            response = requests.get(url, headers=headers, timeout=15)
+            response.raise_for_status()
+            response.encoding = 'utf-8'
+            soup = BeautifulSoup(response.text, 'html.parser')
 
         table = soup.find('table', {'id': 'tblStockHolder'})
         if table is None:
@@ -98,9 +98,9 @@ def plot_stock_major_shareholders(stock_identifier):
         )
         return fig
 
-except Exception as e:
-        print(f"繪製 {stock_code} 股東圖時發生錯誤: {e}")
-        return None
+        except Exception as e:
+            print(f"繪製 {stock_code} 股東圖時發生錯誤: {e}")
+            return None
 
 
 def plot_stock_revenue_trend(stock_identifier):
@@ -125,14 +125,14 @@ def plot_stock_revenue_trend(stock_identifier):
             "Referer": "https://goodinfo.tw/",
         }
 
-    cookie = os.getenv('GOODINFO_COOKIE_MY_STOCK', '')
-    if cookie:
-                headers["Cookie"] = cookie
+        cookie = os.getenv('GOODINFO_COOKIE_MY_STOCK', '')
+        if cookie:
+            headers["Cookie"] = cookie
 
-    try:
-                response = requests.get(url, headers=headers, timeout=15)
-                response.raise_for_status()
-                response.encoding = 'utf-8'
+        try:
+            response = requests.get(url, headers=headers, timeout=15)
+            response.raise_for_status()
+            response.encoding = 'utf-8'
 
         dfs = pd.read_html(StringIO(response.text), flavor='lxml')
         if not dfs:
@@ -189,6 +189,6 @@ def plot_stock_revenue_trend(stock_identifier):
         )
         return fig
 
-except Exception as e:
-        print(f"繪製 {stock_code} 月營收圖時發生錯誤: {e}")
-        return None
+        except Exception as e:
+            print(f"繪製 {stock_code} 月營收圖時發生錯誤: {e}")
+            return None
