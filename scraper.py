@@ -4,6 +4,7 @@ scraper.py (優化版)
 已移除硬編碼備用 Cookie，改用 utils.py 共用模組。
 """
 
+from __future__ import annotations
 import io
 import pandas as pd
 from bs4 import BeautifulSoup
