@@ -1,5 +1,9 @@
-# streamlit_app.py (已整合月營收選股功能、修正時區問題，並加入表格下載CSV功能)
+"""
 
+streamlit_app.py - 台股分析儀
+整合月營收選股、個股分析、集中度等功能。
+已更新為使用 utils.py 共用模組。
+"""
 import streamlit as st
 import pandas as pd
 import os
@@ -18,7 +22,7 @@ try:
     from monthly_revenue_scraper import scrape_goodinfo as scrape_monthly_revenue
     from yahoo_scraper import scrape_yahoo_stock_rankings
     from stock_analyzer import analyze_stock
-    from stock_information_plot import plot_stock_revenue_trend, plot_stock_major_shareholders, get_stock_code
+    from stock_information_plot import plot_stock_revenue_trend, plot_stock_major_shareholders
     from concentration_1day import fetch_stock_concentration_data, filter_stock_data
 
 except ImportError as e:
