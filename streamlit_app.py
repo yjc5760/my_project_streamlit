@@ -1263,19 +1263,21 @@ def display_single_stock_analysis(stock_identifier: str):
                     st.error(f"無法生成技術分析圖: {tech_analysis_result.get('message', '未知錯誤')}")
         with tab2:
             with st.spinner("正在生成月營收趨勢圖..."):
-                revenue_fig, revenue_error = cached_plot_revenue(stock_code)
-                if not revenue_error:
+                # Fix: Only expect one return value
+                revenue_fig = cached_plot_revenue(stock_code)
+                if revenue_fig is not None:
                     st.plotly_chart(revenue_fig, use_container_width=True)
                 else:
-                    st.error(f"無法生成營收圖: {revenue_error}")
+                    st.error("無法生成營收圖 (可能查無資料或發生錯誤)")
         with tab3:
             with st.spinner("正在生成大戶股權變化圖..."):
-                shareholder_fig, shareholder_error = cached_plot_shareholders(stock_code)
-                if not shareholder_error:
+                # Fix: Only expect one return value
+                shareholder_fig = cached_plot_shareholders(stock_code)
+                if shareholder_fig is not None:
                     st.plotly_chart(shareholder_fig, use_container_width=True)
                 else:
-                    st.error(f"無法生成大戶股權圖: {shareholder_error}")
-
+                    st.error("無法生成大戶股權圖 (可能查無資料或發生錯誤)")
+                    
 # --- 主程式進入點 ---
 def main():
     st.title("📈 台股互動分析儀")
