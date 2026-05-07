@@ -1,9 +1,5 @@
-"""
-streamlit_app.py - 台股分析儀
-整合月營收選股、個股分析、集中度等功能。
-已更新為使用 utils.py 共用模組。
-"""
-from __future__ import annotations
+# streamlit_app.py (已整合月營收選股功能、修正時區問題，並加入表格下載CSV功能)
+
 import streamlit as st
 import pandas as pd
 import os
@@ -23,10 +19,10 @@ try:
     from yahoo_scraper import scrape_yahoo_stock_rankings
     from stock_analyzer import analyze_stock
     from stock_information_plot import plot_stock_revenue_trend, plot_stock_major_shareholders
+    from utils import get_stock_code
     from concentration_1day import fetch_stock_concentration_data, filter_stock_data
-    from utils import get_stock_code  # <--- [請務必補上這行]
 
-except (ImportError, TypeError, SyntaxError) as e:
+except ImportError as e:
     st.error(f"無法導入必要的模組。請確認所有 .py 檔案都位於同一個資料夾中。")
     st.error(f"詳細錯誤： {e}")
     st.stop()
@@ -71,15 +67,15 @@ def cached_fetch_concentration_data():
 def cached_scrape_yahoo_rankings(url):
     return scrape_yahoo_stock_rankings(url)
 
-@st.cache_data(ttl=3600) # 個股分析資料快取1小時
+@st.cache_resource(ttl=3600) # 個股分析資料快取1小時（Figure 物件不序列化，用 cache_resource）
 def cached_analyze_stock(stock_id):
     return analyze_stock(stock_id)
 
-@st.cache_data(ttl=86400) # 每日更新一次即可
+@st.cache_resource(ttl=86400) # 每日更新一次即可（Figure 物件用 cache_resource）
 def cached_plot_revenue(stock_id):
     return plot_stock_revenue_trend(stock_id)
 
-@st.cache_data(ttl=86400) # 每週更新一次即可
+@st.cache_resource(ttl=86400) # 每週更新一次即可（Figure 物件用 cache_resource）
 def cached_plot_shareholders(stock_id):
     return plot_stock_major_shareholders(stock_id)
 
@@ -191,9 +187,17 @@ def display_concentration_visualization(df: pd.DataFrame):
         except Exception:
             return None
 
-    viz_df['_K'] = viz_df['KD'].apply(parse_k)
-    viz_df['_D'] = viz_df['KD'].apply(parse_d)
-    viz_df['_I'] = viz_df['I值'].apply(parse_i)
+    if 'KD' in viz_df.columns:
+        viz_df['_K'] = viz_df['KD'].apply(parse_k)
+        viz_df['_D'] = viz_df['KD'].apply(parse_d)
+    else:
+        viz_df['_K'] = np.nan
+        viz_df['_D'] = np.nan
+
+    if 'I值' in viz_df.columns:
+        viz_df['_I'] = viz_df['I值'].apply(parse_i)
+    else:
+        viz_df['_I'] = np.nan
 
     # 轉型數值欄位
     conc_cols = ['1日集中度', '5日集中度', '10日集中度', '20日集中度', '60日集中度', '120日集中度']
@@ -608,8 +612,15 @@ def display_monthly_revenue_visualization(df: pd.DataFrame):
         except Exception:
             return None
 
-    viz_df['_K值'] = viz_df['KD'].apply(parse_k)
-    viz_df['_I值'] = viz_df['I值'].apply(parse_i)
+    if 'KD' in viz_df.columns:
+        viz_df['_K值'] = viz_df['KD'].apply(parse_k)
+    else:
+        viz_df['_K值'] = np.nan
+
+    if 'I值' in viz_df.columns:
+        viz_df['_I值'] = viz_df['I值'].apply(parse_i)
+    else:
+        viz_df['_I值'] = np.nan
 
     # --- 終極精準版：年增與月增都強制要求包含 '%' 符號，並排除干擾欄位 ---
     yoy_col = None
@@ -1263,21 +1274,19 @@ def display_single_stock_analysis(stock_identifier: str):
                     st.error(f"無法生成技術分析圖: {tech_analysis_result.get('message', '未知錯誤')}")
         with tab2:
             with st.spinner("正在生成月營收趨勢圖..."):
-                # Fix: Only expect one return value
                 revenue_fig = cached_plot_revenue(stock_code)
                 if revenue_fig is not None:
                     st.plotly_chart(revenue_fig, use_container_width=True)
                 else:
-                    st.error("無法生成營收圖 (可能查無資料或發生錯誤)")
+                    st.error("無法生成營收圖，請確認股票代碼是否正確或稍後再試。")
         with tab3:
             with st.spinner("正在生成大戶股權變化圖..."):
-                # Fix: Only expect one return value
                 shareholder_fig = cached_plot_shareholders(stock_code)
                 if shareholder_fig is not None:
                     st.plotly_chart(shareholder_fig, use_container_width=True)
                 else:
-                    st.error("無法生成大戶股權圖 (可能查無資料或發生錯誤)")
-                    
+                    st.error("無法生成大戶股權圖，請確認股票代碼是否正確或稍後再試。")
+
 # --- 主程式進入點 ---
 def main():
     st.title("📈 台股互動分析儀")
