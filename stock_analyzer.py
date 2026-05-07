@@ -253,11 +253,7 @@ class TaiwanStockAnalyzer:
 
 def analyze_stock(stock_id: str, days: int = 300) -> dict:
     """
-    主函式：分析指定股票並返回純資料字典（不含 Figure 物件）。
-    
-    【Bug 1 修正】：原本回傳 chart_figure (go.Figure)，但 @st.cache_data 無法序列化
-    Plotly Figure 物件，導致快取不穩定或報錯。現在改為只回傳可序列化的純資料，
-    圖表由 create_chart_from_result() 另行生成，不經過快取。
+    主函式：分析指定股票並返回包含圖表物件的字典。
     """
     try:
         analyzer = TaiwanStockAnalyzer(stock_id, days)
@@ -270,29 +266,17 @@ def analyze_stock(stock_id: str, days: int = 300) -> dict:
         print("計算交易訊號中...")
         analyzer.calculate_signals()
 
+        print(f"產生圖表物件: {stock_id}")
+        chart_figure = analyzer.create_chart()
+
         last_k = analyzer.indicators['k'][-1] if len(analyzer.indicators.get('k', [])) > 0 else None
         last_d = analyzer.indicators['d'][-1] if len(analyzer.indicators.get('d', [])) > 0 else None
         last_i = analyzer.indicators['I_value'][-1] if len(analyzer.indicators.get('I_value', [])) > 0 else None
-        # 只取過去已收盤的交易日，排除當日（避免盤中不完整K棒影響均量）
-        past_data = analyzer.price_data[analyzer.price_data.index.date < date.today()]
-        avg_vol_5 = past_data['Volume'].iloc[-5:].mean() if len(past_data) >= 5 else analyzer.price_data['Volume'].iloc[-6:-1].mean()
-
-        # 將 price_data 轉為 dict 以利序列化（index 須轉為 str）
-        price_data_serializable = analyzer.price_data.copy()
-        price_data_serializable.index = price_data_serializable.index.astype(str)
-
-        # indicators 中的 numpy array 轉為 list 以利序列化
-        serializable_indicators = {
-            k: v.tolist() if hasattr(v, 'tolist') else v
-            for k, v in analyzer.indicators.items()
-        }
+        avg_vol_5 = analyzer.price_data['Volume'].iloc[-6:-1].mean()
 
         return {
             'status': 'success',
-            'stock_id': stock_id,
-            'stock_name': analyzer.stock_name,
-            'price_data_dict': price_data_serializable.reset_index().to_dict('list'),
-            'indicators_lists': serializable_indicators,
+            'chart_figure': chart_figure, # 返回圖表物件，而不是圖片路徑
             'indicators': {
                 'k': last_k,
                 'd': last_d,
@@ -308,72 +292,3 @@ def analyze_stock(stock_id: str, days: int = 300) -> dict:
             'status': 'error',
             'message': error_message
         }
-
-
-def create_chart_from_result(result: dict) -> go.Figure:
-    """
-    【Bug 1 新增】：從 analyze_stock() 的純資料結果重建 Plotly Figure。
-    此函式不經過 @st.cache_data，因為 Figure 物件無法被序列化。
-    呼叫前請先確認 result['status'] == 'success'。
-    """
-    stock_id = result['stock_id']
-    stock_name = result['stock_name']
-    price_data_dict = result['price_data_dict']
-    indicators = result['indicators_lists']
-
-    # 還原 DataFrame
-    df = pd.DataFrame(price_data_dict)
-    df['Date'] = pd.to_datetime(df['Date'])
-    df.set_index('Date', inplace=True)
-
-    for key, value in indicators.items():
-        df[key] = value
-
-    df = df.iloc[101:].copy()
-
-    fig = make_subplots(
-        rows=7, cols=1,
-        shared_xaxes=True,
-        vertical_spacing=0.03,
-        row_heights=[0.4, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
-    )
-
-    fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='K線'), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=df['sma5'], mode='lines', name='週線(5)', line=dict(color='blue', width=1)), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=df['sma20'], mode='lines', name='月線(20)', line=dict(color='orange', width=1)), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=df['sma60'], mode='lines', name='季線(60)', line=dict(color='red', width=1)), row=1, col=1)
-    fig.add_trace(go.Bar(x=df.index, y=df['Volume'], name='成交量', marker_color='grey'), row=2, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=df['k'], mode='lines', name='K值', line=dict(color='red', width=1)), row=3, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=df['d'], mode='lines', name='D值', line=dict(color='green', width=1)), row=3, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=df['L_value'], mode='markers', name='KD訊號', marker=dict(color='blue', size=8)), row=3, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=df['dev_5_20'], mode='lines', name='週-月', line=dict(color='red', width=1)), row=4, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=df['dev_20_60'], mode='lines', name='月-季', line=dict(color='green', width=1)), row=4, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=df['dev_5_60'], mode='lines', name='週-季', line=dict(color='orange', width=1)), row=4, col=1)
-    fig.add_trace(go.Bar(x=df.index, y=df['I_value'], name='階梯訊號', marker_color='red'), row=5, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=df['J_value'], mode='markers', name='乖離訊號', marker=dict(color='blue', size=8)), row=5, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=df['K_value'], mode='lines', name='多空訊號', line=dict(color='orange', width=2)), row=5, col=1)
-
-    colors = ['green' if val < 0 else 'red' for val in df['macd_hist']]
-    fig.add_trace(go.Bar(x=df.index, y=df['macd_hist'], name='Histogram', marker_color=colors), row=6, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=df['macd'], mode='lines', name='MACD', line=dict(color='blue', width=1)), row=6, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=df['macd_signal'], mode='lines', name='Signal', line=dict(color='red', width=1)), row=6, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=df['wma5'], mode='lines', name='5WMA', line=dict(color='red', width=1.5)), row=7, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=df['wma10'], mode='lines', name='10WMA', line=dict(color='green', width=1.5)), row=7, col=1)
-
-    fig.update_layout(
-        title=f'{stock_name} ({stock_id}) 技術分析圖',
-        height=1200,
-        xaxis_rangeslider_visible=False,
-        showlegend=True,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-    )
-    fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])], tickformat='%Y-%m-%d')
-    fig.update_yaxes(title_text="股價", row=1, col=1)
-    fig.update_yaxes(title_text="成交量", row=2, col=1)
-    fig.update_yaxes(title_text="KD", row=3, col=1)
-    fig.update_yaxes(title_text="乖離(%)", row=4, col=1)
-    fig.update_yaxes(title_text="訊號", row=5, col=1)
-    fig.update_yaxes(title_text="MACD", row=6, col=1)
-    fig.update_yaxes(title_text="WMA", row=7, col=1)
-
-    return fig
