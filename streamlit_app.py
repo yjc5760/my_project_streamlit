@@ -1,5 +1,4 @@
 """
-
 streamlit_app.py - 台股分析儀
 整合月營收選股、個股分析、集中度等功能。
 已更新為使用 utils.py 共用模組。
@@ -25,6 +24,7 @@ try:
     from stock_analyzer import analyze_stock
     from stock_information_plot import plot_stock_revenue_trend, plot_stock_major_shareholders
     from concentration_1day import fetch_stock_concentration_data, filter_stock_data
+    from utils import get_stock_code  # <--- [請務必補上這行]
 
 except (ImportError, TypeError, SyntaxError) as e:
     st.error(f"無法導入必要的模組。請確認所有 .py 檔案都位於同一個資料夾中。")
