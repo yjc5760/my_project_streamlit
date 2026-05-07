@@ -71,11 +71,11 @@ def cached_scrape_yahoo_rankings(url):
 def cached_analyze_stock(stock_id):
     return analyze_stock(stock_id)
 
-@st.cache_resource(ttl=86400) # 每日更新一次即可（Figure 物件用 cache_resource）
+@st.cache_data(ttl=86400)  # go.Figure 可 pickle；使用 cache_data 避免錯誤結果被永久鎖住
 def cached_plot_revenue(stock_id):
     return plot_stock_revenue_trend(stock_id)
 
-@st.cache_resource(ttl=86400) # 每週更新一次即可（Figure 物件用 cache_resource）
+@st.cache_data(ttl=86400)
 def cached_plot_shareholders(stock_id):
     return plot_stock_major_shareholders(stock_id)
 
@@ -1274,18 +1274,24 @@ def display_single_stock_analysis(stock_identifier: str):
                     st.error(f"無法生成技術分析圖: {tech_analysis_result.get('message', '未知錯誤')}")
         with tab2:
             with st.spinner("正在生成月營收趨勢圖..."):
-                revenue_fig = cached_plot_revenue(stock_code)
+                revenue_fig, revenue_err = cached_plot_revenue(stock_code)
                 if revenue_fig is not None:
                     st.plotly_chart(revenue_fig, use_container_width=True)
                 else:
-                    st.error("無法生成營收圖，請確認股票代碼是否正確或稍後再試。")
+                    err_msg = revenue_err or "未知錯誤，請稍後再試"
+                    st.error(f"無法生成營收圖：{err_msg}")
+                    if "403" in str(revenue_err) or "Cookie" in str(revenue_err):
+                        st.info("💡 提示：Goodinfo 需要有效的登入 Cookie。請至 Streamlit Secrets 更新 GOODINFO_COOKIE_MONTHLY 或 GOODINFO_COOKIE_MY_STOCK。")
         with tab3:
             with st.spinner("正在生成大戶股權變化圖..."):
-                shareholder_fig = cached_plot_shareholders(stock_code)
+                shareholder_fig, shareholder_err = cached_plot_shareholders(stock_code)
                 if shareholder_fig is not None:
                     st.plotly_chart(shareholder_fig, use_container_width=True)
                 else:
-                    st.error("無法生成大戶股權圖，請確認股票代碼是否正確或稍後再試。")
+                    err_msg = shareholder_err or "未知錯誤，請稍後再試"
+                    st.error(f"無法生成大戶股權圖：{err_msg}")
+                    if "403" in str(shareholder_err) or "Cookie" in str(shareholder_err):
+                        st.info("💡 提示：Goodinfo 需要有效的登入 Cookie。請至 Streamlit Secrets 更新 GOODINFO_COOKIE_MONTHLY 或 GOODINFO_COOKIE_MY_STOCK。")
 
 # --- 主程式進入點 ---
 def main():
