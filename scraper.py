@@ -1,5 +1,4 @@
-# scraper.py 
-
+# scraper.py (移除硬編碼 Cookie 版本)
 import os
 import sys
 import requests
@@ -11,16 +10,16 @@ import io
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 
-# 🛑 [已移除原本寫死的 _FALLBACK_COOKIE] 🛑
-
 def scrape_goodinfo():
     """
     爬取 Goodinfo 台灣股市資訊網 "我的選股103" 的資料並回傳 DataFrame。
     快取由 streamlit_app.py 的 cached_scrape_goodinfo 統一管理。
     """
-    url = "https://goodinfo.tw/tw/StockListFilter/StockList.asp?STEP=DATA..." # (網址保持不變)
+
+    # --- 1. 設定爬蟲參數 ---
+    url = "https://goodinfo.tw/tw/StockListFilter/StockList.asp?STEP=DATA&MARKET_CAT=%E8%87%AA%E8%A8%82%E7%AF%A9%E9%81%B8&INDUSTRY_CAT=%E6%88%91%E7%9A%84%E6%A2%9D%E4%BB%B6&SHEET=%E4%BA%A4%E6%98%93%E7%8B%80%E6%B3%81&SHEET2=%E6%97%A5&FL_SHEET=%E4%BA%A4%E6%98%93%E7%8B%80%E6%B3%81&FL_SHEET2=%E6%97%A5&FL_MARKET=%E4%B8%8A%E5%B8%82%2F%E4%B8%8A%E6%AB%83&MY_FL_RULE_NM=%E9%81%B8%E8%82%A103&FL_ITEM0=%E7%95%B6%E6%97%A5%EF%BC%9A%E7%B4%85K%E6%A3%92%E6%A3%92%E5%B9%85%28%25%29&FL_VAL_S0=2%2E5&FL_VAL_E0=10&FL_ITEM1=%E6%88%90%E4%BA%A4%E5%BC%B5%E6%95%B8+%28%E5%BC%B5%29&FL_VAL_S1=5000&FL_VAL_E1=900000&FL_ITEM3=%E5%9D%87%E7%B7%9A%E4%B9%96%E9%9B%A2%28%25%29%E2%80%93%E5%AD%A3&FL_VAL_S3=%2D5&FL_VAL_E3=5&FL_ITEM4=K%E5%80%BC+%28%E9%80%B1%29&FL_VAL_S4=0&FL_VAL_E4=50&FL_RULE0=KD%7C%7C%E9%80%B1K%E5%80%BC+%E2%86%97%40%40%E9%80%B1KD%E8%B5%B0%E5%8B%A2%40%40K%E5%80%BC+%E2%86%97&FL_RULE1=%E5%9D%87%E7%B7%9A%E4%BD%8D%E7%BD%AE%7C%7C%E6%9C%88%2F%E5%AD%A3%E7%B7%9A%E7%A9%BA%E9%A0%AD%E6%8E%92%E5%88%97%40%40%E5%9D%87%E5%83%B9%E7%B7%9A%E7%A9%BA%E9%A0%AD%E6%8E%92%E5%88%97%40%40%E6%9C%88%2F%E5%AD%A3&FL_FD0=K%E5%80%BC+%28%E6%97%A5%29%7C%7C1%7C%7C0%7C%7C%3E%7C%7CD%E5%80%BC+%28%E6%97%A5%29%7C%7C1%7C%7C0&FL_FD1=%E6%88%90%E4%BA%A4%E5%BC%B5%E6%95%B8+%28%E5%BC%B5%29%7C%7C1%7C%7C0%7C%7C%3E%7C%7C%E6%98%A8%E6%97%A5%E6%88%90%E4%BA%A4%E5%BC%B5%E6%95%B8+%28%E5%BC%B5%29%7C%7C1%2E3%7C%7C0&FL_FD2=%7C%7C1%7C%7C0%7C%7C%3D%7C%7C%7C%7C1%7C%7C0&FL_FD3=%7C%7C1%7C%7C0%7C%7C%3D%7C%7C%7C%7C1%7C%7C0&FL_FD4=%7C%7C1%7C%7C0%7C%7C%3D%7C%7C%7C%7C1%7C%7C0&FL_FD5=%7C%7C1%7C%7C0%7C%7C%3D%7C%7C%7C%7C1%7C%7C0&IS_RELOAD_REPORT=T"
     
-    # --- 1. 從環境變數讀取 Cookie 並加上防呆檢查 ---
+    # 🛑 [修改重點] 嚴格檢查環境變數，不再使用寫死的 Cookie 🛑
     cookie = os.getenv('GOODINFO_COOKIE_MY_STOCK')
     if not cookie:
         print("❌ 錯誤：未找到 GOODINFO_COOKIE_MY_STOCK。請確認已在 Streamlit secrets 中設定。")
@@ -80,14 +79,15 @@ def scrape_goodinfo():
 
         df_filtered = df[columns_to_keep].copy()
 
+        # 清理「名稱」欄位
         if '名稱' in df_filtered.columns and df_filtered['名稱'].dtype == 'object':
             df_filtered['名稱'] = df_filtered['名稱'].astype(str).str.replace(r' (市|櫃)$', '', regex=True)
 
+        # 統一將「代號」改名為「代碼」
         if '代號' in df_filtered.columns:
             df_filtered.rename(columns={'代號': '代碼'}, inplace=True)
 
         # 正規化欄位名稱：移除所有空白字元，以符合 streamlit_app.py 的期望
-        # (Goodinfo HTML 的欄位名稱常含多餘空格，例如 '市 場' → '市場')
         df_filtered.columns = df_filtered.columns.astype(str).str.replace(r'\s+', '', regex=True)
 
         print(f"成功爬取到 {len(df_filtered)} 筆資料。")
