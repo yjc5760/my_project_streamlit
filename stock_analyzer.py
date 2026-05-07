@@ -273,7 +273,9 @@ def analyze_stock(stock_id: str, days: int = 300) -> dict:
         last_k = analyzer.indicators['k'][-1] if len(analyzer.indicators.get('k', [])) > 0 else None
         last_d = analyzer.indicators['d'][-1] if len(analyzer.indicators.get('d', [])) > 0 else None
         last_i = analyzer.indicators['I_value'][-1] if len(analyzer.indicators.get('I_value', [])) > 0 else None
-        avg_vol_5 = analyzer.price_data['Volume'].iloc[-6:-1].mean()
+        # 只取過去已收盤的交易日，排除當日（避免盤中不完整K棒影響均量）
+        past_data = analyzer.price_data[analyzer.price_data.index.date < date.today()]
+        avg_vol_5 = past_data['Volume'].iloc[-5:].mean() if len(past_data) >= 5 else analyzer.price_data['Volume'].iloc[-6:-1].mean()
 
         # 將 price_data 轉為 dict 以利序列化（index 須轉為 str）
         price_data_serializable = analyzer.price_data.copy()
