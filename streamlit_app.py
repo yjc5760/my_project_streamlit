@@ -15,8 +15,8 @@ import plotly.io as pio
 from plotly.subplots import make_subplots
 
 try:
-    from scraper import scrape_goodinfo
-    from monthly_revenue_scraper import scrape_goodinfo as scrape_monthly_revenue
+    from finmind_my_stock_scraper import scrape_goodinfo
+    from finmind_monthly_revenue_scraper import scrape_goodinfo as scrape_monthly_revenue
     from yahoo_scraper import scrape_yahoo_stock_rankings
     from stock_analyzer import analyze_stock
     from stock_information_plot import plot_stock_revenue_trend, plot_stock_major_shareholders, get_stock_code
