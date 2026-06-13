@@ -1,4 +1,5 @@
 import os
+import time
 import pandas as pd
 import numpy as np
 import requests
@@ -9,6 +10,34 @@ from datetime import date, timedelta
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+
+
+def _get_with_retry(
+    url: str,
+    params: dict,
+    headers: dict,
+    timeout: int = 20,
+    max_retries: int = 3
+) -> requests.Response:
+    """帶指數退避的 GET 請求；HTTP 429 Rate Limit 時自動重試。"""
+    last_exc: Exception | None = None
+    for attempt in range(max_retries):
+        try:
+            resp = requests.get(url, params=params, headers=headers, timeout=timeout)
+            if resp.status_code == 429 and attempt < max_retries - 1:
+                wait = 2 ** attempt
+                print(f"⚠️  FinMind Rate Limit (429)，{wait}s 後重試 ({attempt+1}/{max_retries})...")
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            return resp
+        except requests.exceptions.RequestException as exc:
+            last_exc = exc
+            if attempt < max_retries - 1:
+                time.sleep(1)
+    raise requests.exceptions.RequestException(
+        f"連線失敗，已重試 {max_retries} 次: {last_exc}"
+    )
 class TaiwanStockAnalyzer:
     def __init__(self, stock_id: str, days: int = 300) -> None:
         """
@@ -52,8 +81,7 @@ class TaiwanStockAnalyzer:
             print("警告: 未設定 FINMIND_API_TOKEN 環境變數，將嘗試匿名存取 FinMind API。")
 
         try:
-            response = requests.get(finmind_url, params=params, headers=headers, timeout=20)
-            response.raise_for_status()
+            response = _get_with_retry(finmind_url, params=params, headers=headers, timeout=20)
             raw_data = response.json()
             
             if raw_data.get("status") != 200:

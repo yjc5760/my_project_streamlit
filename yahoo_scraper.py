@@ -1,12 +1,18 @@
 # yahoo_scraper.py (已修正時區問題)
 
+import time
 import requests
 import pandas as pd
 from bs4 import BeautifulSoup
 from io import StringIO
 import re
 from datetime import datetime
-from zoneinfo import ZoneInfo # 修正：導入 ZoneInfo 模組
+from zoneinfo import ZoneInfo  # 修正：導入 ZoneInfo 模組
+
+
+def _time_to_seconds(t) -> int:
+    """將 datetime.time 物件轉換為秒數（模組層級輔助函式）"""
+    return t.hour * 3600 + t.minute * 60 + t.second
 
 # 預估成交量因子表：模組載入時建立一次，後續查表不重複解析
 _CSV_DATA = """Time,Factor
@@ -100,14 +106,11 @@ def _get_volume_factor() -> float:
         return upper_bound['Factor']
     lower_bound = lower_bound_df.iloc[-1]
 
-    def time_to_seconds(t):
-        return t.hour * 3600 + t.minute * 60 + t.second
-
-    t1_sec = time_to_seconds(lower_bound['Time'])
+    t1_sec = _time_to_seconds(lower_bound['Time'])
     f1 = lower_bound['Factor']
-    t2_sec = time_to_seconds(upper_bound['Time'])
+    t2_sec = _time_to_seconds(upper_bound['Time'])
     f2 = upper_bound['Factor']
-    now_sec = time_to_seconds(now_time)
+    now_sec = _time_to_seconds(now_time)
 
     if t2_sec == t1_sec:
         return f1
@@ -126,7 +129,13 @@ def scrape_yahoo_stock_rankings(url: str) -> pd.DataFrame | None:
     }
 
     try:
-        res = requests.get(url, headers=headers, timeout=10)
+        # 最多重試 3 次（指數退避）
+        for _attempt in range(3):
+            res = requests.get(url, headers=headers, timeout=10)
+            if res.status_code == 200:
+                break
+            if _attempt < 2:
+                time.sleep(2 ** _attempt)
         res.raise_for_status()
         res.encoding = 'utf-8'
 

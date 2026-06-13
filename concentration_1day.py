@@ -1,5 +1,6 @@
 # 1日籌碼集中度.py (已修改欄位顯示)
 
+import time
 import requests
 import pandas as pd
 from io import StringIO
@@ -22,7 +23,13 @@ def fetch_stock_concentration_data():
     }
 
     try:
-        response = requests.get(url, headers=headers, timeout=20)
+        # 最多重試 3 次（指數退避）
+        for _attempt in range(3):
+            response = requests.get(url, headers=headers, timeout=20)
+            if response.status_code == 200:
+                break
+            if _attempt < 2:
+                time.sleep(2 ** _attempt)
         response.raise_for_status()
         response.encoding = 'big5'
 

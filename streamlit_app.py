@@ -74,22 +74,78 @@ def _fig_from_cache(json_str: str | None):
     """JSON 字串 → Plotly Figure"""
     return pio.from_json(json_str) if json_str else None
 
+
+# -------------------------------------------------------------------------------
+# 輔助解析函式（模組層級，避免在多個視覺化函式內重複定義）
+# -------------------------------------------------------------------------------
+def _parse_k(kd_str) -> float | None:
+    """從 'K:XX.XX D:XX.XX' 字串擷取 K 值"""
+    m = re.search(r'K:([\d.]+)', str(kd_str))
+    return float(m.group(1)) if m else None
+
+def _parse_d(kd_str) -> float | None:
+    """從 'K:XX.XX D:XX.XX' 字串擷取 D 值"""
+    m = re.search(r'D:([\d.]+)', str(kd_str))
+    return float(m.group(1)) if m else None
+
+def _parse_i(i_str) -> float | None:
+    """解析 I 值字串為浮點數，無效值回傳 None"""
+    v = str(i_str).strip()
+    try:
+        return float(v) if v not in ('N/A', '錯誤', 'nan', '') else None
+    except Exception:
+        return None
+
+def _batch_kd_analyze(
+    stock_codes: list[str],
+    progress_bar=None,
+    label_prefix: str = '正在分析'
+) -> dict[str, dict]:
+    """
+    並發分析多檔股票（ThreadPoolExecutor, max_workers=4）。
+    自動去除無效代碼與重複項，回傳 {code: analysis_result}。
+    progress_bar: st.progress 物件（可選）
+    """
+    unique_codes = list(dict.fromkeys(c for c in stock_codes if c and c != 'nan'))
+    total = len(unique_codes)
+    if total == 0:
+        return {}
+    results: dict[str, dict] = {}
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        future_to_code = {
+            executor.submit(cached_analyze_stock, code): code
+            for code in unique_codes
+        }
+        for i, future in enumerate(as_completed(future_to_code), 1):
+            code = future_to_code[future]
+            try:
+                results[code] = future.result()
+            except Exception as exc:
+                results[code] = {
+                    'status': 'error',
+                    'error_type': 'unknown',
+                    'message': str(exc)
+                }
+            if progress_bar is not None:
+                progress_bar.progress(i / total, text=f"{label_prefix}: {code} ({i}/{total})")
+    return results
+
 # --------------------------------------------------------------------------------
 # OPTIMIZATION: Cached Data Fetching Functions（動態 TTL 版）
 # --------------------------------------------------------------------------------
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=market_ttl(300, 3600))   # 盤中5分鐘；盤後1小時
 def cached_scrape_goodinfo():
     return scrape_goodinfo()
 
-@st.cache_data(ttl=1800)
+@st.cache_data(ttl=market_ttl(1800, 86400))  # 盤中30分鐘；盤後1日
 def cached_scrape_monthly_revenue():
     return scrape_monthly_revenue()
 
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=market_ttl(300, 3600))   # 盤中5分鐘；盤後1小時
 def cached_fetch_concentration_data():
     return fetch_stock_concentration_data()
 
-@st.cache_data(ttl=300)  # Yahoo 排行榜：盤中 5 分鐘，但實際 TTL 由呼叫方決定是否重試
+@st.cache_data(ttl=market_ttl(60, 300))     # 盤中1分鐘；盤後5分鐘
 def cached_scrape_yahoo_rankings(url):
     return scrape_yahoo_stock_rankings(url)
 
@@ -223,31 +279,10 @@ def display_concentration_visualization(df: pd.DataFrame):
 
     viz_df = df.copy()
 
-    # --- 解析輔助欄位 ---
-    def parse_k(kd_str):
-        try:
-            m = re.search(r'K:([\d.]+)', str(kd_str))
-            return float(m.group(1)) if m else None
-        except Exception:
-            return None
-
-    def parse_d(kd_str):
-        try:
-            m = re.search(r'D:([\d.]+)', str(kd_str))
-            return float(m.group(1)) if m else None
-        except Exception:
-            return None
-
-    def parse_i(i_str):
-        try:
-            v = str(i_str).strip()
-            return float(v) if v not in ('N/A', '錯誤', 'nan', '') else None
-        except Exception:
-            return None
-
-    viz_df['_K'] = viz_df['KD'].apply(parse_k)
-    viz_df['_D'] = viz_df['KD'].apply(parse_d)
-    viz_df['_I'] = viz_df['I值'].apply(parse_i)
+    # --- 解析輔助欄位（使用模組層級函式） ---
+    viz_df['_K'] = viz_df['KD'].apply(_parse_k)
+    viz_df['_D'] = viz_df['KD'].apply(_parse_d)
+    viz_df['_I'] = viz_df['I值'].apply(_parse_i)
 
     # 轉型數值欄位
     conc_cols = ['1日集中度', '5日集中度', '10日集中度', '20日集中度', '60日集中度', '120日集中度']
@@ -487,26 +522,23 @@ def display_concentration_results():
             
             if filtered_stocks is not None and not filtered_stocks.empty:
                 st.success(f"找到 {len(filtered_stocks)} 檔符合條件的股票，正在進行技術指標分析...")
-                
-                k_values = []
-                d_values = []
-                i_values = []
-                
-                progress_bar = st.progress(0, text="分析進度")
-                total_stocks = len(filtered_stocks)
 
-                concentration_cache = {}  # 避免 expander 重複呼叫
-                for i, stock_row in enumerate(filtered_stocks.itertuples()):
-                    stock_code = str(stock_row.代碼)
-                    analysis_result = cached_analyze_stock(stock_code)
-                    concentration_cache[stock_code] = analysis_result
-                    
-                    if analysis_result['status'] == 'success':
-                        indicators = analysis_result.get('indicators', {})
+                # 並發分析（以 ThreadPoolExecutor 取代逐筆順序呼叫）
+                stock_codes_ordered = [str(r.代碼) for r in filtered_stocks.itertuples()]
+                progress_bar = st.progress(0, text="分析進度")
+                concentration_cache = _batch_kd_analyze(
+                    stock_codes_ordered, progress_bar, label_prefix="正在分析"
+                )
+                progress_bar.empty()
+
+                k_values, d_values, i_values = [], [], []
+                for code in stock_codes_ordered:
+                    result = concentration_cache.get(code, {'status': 'error', 'message': '分析失敗'})
+                    if result['status'] == 'success':
+                        indicators = result.get('indicators', {})
                         k_val = indicators.get('k')
                         d_val = indicators.get('d')
                         i_val = indicators.get('i_value')
-                        
                         k_values.append(f"{k_val:.2f}" if k_val is not None else "N/A")
                         d_values.append(f"{d_val:.2f}" if d_val is not None else "N/A")
                         i_values.append(i_val if i_val is not None else "N/A")
@@ -514,10 +546,6 @@ def display_concentration_results():
                         k_values.append("錯誤")
                         d_values.append("錯誤")
                         i_values.append("錯誤")
-                    
-                    progress_bar.progress((i + 1) / total_stocks, text=f"正在分析: {stock_code}")
-                
-                progress_bar.empty()
 
                 filtered_stocks['KD'] = [f"K:{k} D:{d}" for k, d in zip(k_values, d_values)]
                 filtered_stocks['I值'] = i_values
@@ -565,42 +593,28 @@ def display_goodinfo_results():
     if scraped_df is not None and not scraped_df.empty:
         st.success(f"成功爬取到 {len(scraped_df)} 筆資料，正在進行技術指標分析...")
 
-        k_values = []
-        d_values = []
-        i_values = []
-        analysis_cache = {}  # 快取本次分析結果，避免 expander 展開時重複呼叫 API
-        
+        # 並發分析（以 ThreadPoolExecutor 取代逐筆順序呼叫）
+        raw_codes = [str(r.代碼).strip() for r in scraped_df.itertuples()]
         progress_bar = st.progress(0, text="分析進度")
-        total_stocks = len(scraped_df)
+        analysis_cache = _batch_kd_analyze(raw_codes, progress_bar, label_prefix="正在分析")
+        progress_bar.empty()
 
-        for i, stock_row in enumerate(scraped_df.itertuples()):
-            stock_code = str(stock_row.代碼).strip()
-            if not stock_code or stock_code == 'nan':
-                k_values.append("N/A")
-                d_values.append("N/A")
-                i_values.append("N/A")
+        k_values, d_values, i_values = [], [], []
+        for code in raw_codes:
+            if not code or code == 'nan':
+                k_values.append("N/A"); d_values.append("N/A"); i_values.append("N/A")
                 continue
-
-            analysis_result = cached_analyze_stock(stock_code)
-            analysis_cache[stock_code] = analysis_result  # 存入本地快取
-            
-            if analysis_result['status'] == 'success':
-                indicators = analysis_result.get('indicators', {})
+            result = analysis_cache.get(code, {'status': 'error', 'message': '分析失敗'})
+            if result['status'] == 'success':
+                indicators = result.get('indicators', {})
                 k_val = indicators.get('k')
                 d_val = indicators.get('d')
                 i_val = indicators.get('i_value')
-                
                 k_values.append(f"{k_val:.2f}" if k_val is not None else "N/A")
                 d_values.append(f"{d_val:.2f}" if d_val is not None else "N/A")
                 i_values.append(i_val if i_val is not None else "N/A")
             else:
-                k_values.append("錯誤")
-                d_values.append("錯誤")
-                i_values.append("錯誤")
-            
-            progress_bar.progress((i + 1) / total_stocks, text=f"正在分析: {stock_code}")
-
-        progress_bar.empty()
+                k_values.append("錯誤"); d_values.append("錯誤"); i_values.append("錯誤")
 
         scraped_df['KD'] = [f"K:{k} D:{d}" for k, d in zip(k_values, d_values)]
         scraped_df['I值'] = i_values
@@ -639,52 +653,6 @@ def display_goodinfo_results():
     else:
         st.warning("未爬取到任何資料。請檢查 Cookie 是否有效。")
 
-        # ── Debug 區塊：跳過快取重新爬取並顯示詳細 log ──────────────────────────
-        with st.expander("🔧 診斷工具：重新爬取並檢視詳細 log", expanded=True):
-            st.caption("點擊下方按鈕可跳過快取、重新執行爬蟲，並在此顯示完整的錯誤訊息，協助診斷 Cookie 或網路問題。")
-            if st.button("🔄 立即重新爬取（跳過快取）", key="debug_rescrape_my_stock"):
-                import sys
-                import io as _io
-                import traceback
-                from scraper import scrape_goodinfo as _raw_scrape
-
-                # 捕捉 scraper 的所有 print 輸出
-                buf = _io.StringIO()
-                old_stdout = sys.stdout
-                sys.stdout = buf
-
-                debug_result = None
-                debug_error = None
-                try:
-                    debug_result = _raw_scrape()
-                except Exception as _e:
-                    debug_error = traceback.format_exc()
-                finally:
-                    sys.stdout = old_stdout
-
-                logs = buf.getvalue()
-
-                st.subheader("📋 Scraper 執行 Log")
-                if logs:
-                    st.code(logs, language="text")
-                else:
-                    st.info("（無 print 輸出）")
-
-                if debug_error:
-                    st.subheader("💥 例外錯誤")
-                    st.code(debug_error, language="text")
-
-                if debug_result is not None and not debug_result.empty:
-                    st.success(f"✅ 重新爬取成功！共 {len(debug_result)} 筆資料。")
-                    st.dataframe(debug_result.head(10))
-                    st.info("資料已確認可取得，請點擊「我的選股」按鈕再試一次（快取已在本次爬取後更新）。")
-                    # 清除舊快取，讓下次點選按鈕直接使用新結果
-                    cached_scrape_goodinfo.clear()
-                elif debug_result is not None and debug_result.empty:
-                    st.warning("⚠️ 爬蟲執行成功但回傳空 DataFrame（今日可能無符合條件的股票）。")
-                else:
-                    st.error("❌ 爬蟲回傳 None，請查看上方 Log 找出原因。")
-
 
 def display_monthly_revenue_visualization(df: pd.DataFrame):
     """
@@ -699,24 +667,9 @@ def display_monthly_revenue_visualization(df: pd.DataFrame):
 
     viz_df = df.copy()
 
-    # --- 解析 K 值 (從 "K:XX.XX D:XX.XX" 格式) ---
-    def parse_k(kd_str):
-        try:
-            m = re.search(r'K:([\d.]+)', str(kd_str))
-            return float(m.group(1)) if m else None
-        except Exception:
-            return None
-
-    # --- 解析 I 值 ---
-    def parse_i(i_str):
-        try:
-            v = str(i_str).strip()
-            return float(v) if v not in ('N/A', '錯誤', 'nan', '') else None
-        except Exception:
-            return None
-
-    viz_df['_K值'] = viz_df['KD'].apply(parse_k)
-    viz_df['_I值'] = viz_df['I值'].apply(parse_i)
+    # --- 解析 K / I 值（使用模組層級函式） ---
+    viz_df['_K值'] = viz_df['KD'].apply(_parse_k)
+    viz_df['_I值'] = viz_df['I值'].apply(_parse_i)
 
     # --- 終極精準版：年增與月增都強制要求包含 '%' 符號，並排除干擾欄位 ---
     yoy_col = None
@@ -940,42 +893,28 @@ def display_monthly_revenue_results():
     if scraped_df is not None and not scraped_df.empty:
         st.success(f"成功爬取到 {len(scraped_df)} 筆資料，正在進行技術指標分析...")
 
-        k_values = []
-        d_values = []
-        i_values = []
-
+        # 並發分析（以 ThreadPoolExecutor 取代逐筆順序呼叫）
+        raw_codes = [str(r.代碼).strip() for r in scraped_df.itertuples()]
         progress_bar = st.progress(0, text="分析進度")
-        total_stocks = len(scraped_df)
+        revenue_cache = _batch_kd_analyze(raw_codes, progress_bar, label_prefix="正在分析")
+        progress_bar.empty()
 
-        revenue_cache = {}  # 避免 expander 重複呼叫 API
-        for i, stock_row in enumerate(scraped_df.itertuples()):
-            stock_code = str(stock_row.代碼).strip()
-            if not stock_code or stock_code == 'nan':
-                k_values.append("N/A")
-                d_values.append("N/A")
-                i_values.append("N/A")
+        k_values, d_values, i_values = [], [], []
+        for code in raw_codes:
+            if not code or code == 'nan':
+                k_values.append("N/A"); d_values.append("N/A"); i_values.append("N/A")
                 continue
-
-            analysis_result = cached_analyze_stock(stock_code)
-            revenue_cache[stock_code] = analysis_result
-
-            if analysis_result['status'] == 'success':
-                indicators = analysis_result.get('indicators', {})
+            result = revenue_cache.get(code, {'status': 'error', 'message': '分析失敗'})
+            if result['status'] == 'success':
+                indicators = result.get('indicators', {})
                 k_val = indicators.get('k')
                 d_val = indicators.get('d')
                 i_val = indicators.get('i_value')
-
                 k_values.append(f"{k_val:.2f}" if k_val is not None else "N/A")
                 d_values.append(f"{d_val:.2f}" if d_val is not None else "N/A")
                 i_values.append(i_val if i_val is not None else "N/A")
             else:
-                k_values.append("錯誤")
-                d_values.append("錯誤")
-                i_values.append("錯誤")
-
-            progress_bar.progress((i + 1) / total_stocks, text=f"正在分析: {stock_code}")
-
-        progress_bar.empty()
+                k_values.append("錯誤"); d_values.append("錯誤"); i_values.append("錯誤")
 
         scraped_df['KD'] = [f"K:{k} D:{d}" for k, d in zip(k_values, d_values)]
         scraped_df['I值'] = i_values
