@@ -6,6 +6,8 @@ import requests
 import twstock
 from datetime import date, timedelta
 
+from indicators import tw_kd
+
 # --- 新增 Plotly 相關導入 ---
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -133,17 +135,10 @@ class TaiwanStockAnalyzer:
     def _calculate_sma(self, data, period):
         return pd.Series(data).rolling(window=period).mean().values
 
-    def _calculate_stochastic(self, high, low, close, k_period=9, k_slowing=3, d_period=3):
-        high_s = pd.Series(high)
-        low_s = pd.Series(low)
-        close_s = pd.Series(close)
-        min_low = low_s.rolling(window=k_period).min()
-        max_high = high_s.rolling(window=k_period).max()
-        denom = (max_high - min_low).replace(0, np.nan)  # 避免停板/無波動時除以零
-        raw_k = 100 * ((close_s - min_low) / denom)
-        k = raw_k.rolling(window=k_slowing).mean().values
-        d = pd.Series(k).rolling(window=d_period).mean().values
-        return k, d
+    def _calculate_stochastic(self, high, low, close, k_period=9):
+        """台灣遞迴式 KD（與 Goodinfo 一致），取代原本 SMA 平滑的慢速隨機指標。"""
+        k, d = tw_kd(high, low, close, n=k_period)
+        return k.to_numpy(), d.to_numpy()
 
     def _calculate_macd(self, prices, fast_period=12, slow_period=26, signal_period=9):
         prices_s = pd.Series(prices)
@@ -348,4 +343,4 @@ def analyze_stock(stock_id: str, days: int = 300) -> dict:
             'status': 'error',
             'error_type': error_type,
             'message': error_message
-        }
+        }

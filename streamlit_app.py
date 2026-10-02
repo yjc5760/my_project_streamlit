@@ -4,6 +4,7 @@ import streamlit as st
 import pandas as pd
 import os
 import re
+from dataclasses import asdict
 from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
 import twstock
@@ -15,7 +16,7 @@ import plotly.io as pio
 from plotly.subplots import make_subplots
 
 try:
-    from scraper import scrape_goodinfo
+    from local_screener import screen_103, Screen103Params, ScreenerError
     from monthly_revenue_scraper import scrape_goodinfo as scrape_monthly_revenue
     from yahoo_scraper import scrape_yahoo_stock_rankings
     from stock_analyzer import analyze_stock
@@ -38,9 +39,7 @@ try:
         os.environ['FINMIND_API_TOKEN'] = st.secrets['FINMIND_API_TOKEN']
     else:
         st.warning("在 Streamlit secrets 中找不到 FinMind API token。部分圖表可能無法生成。")
-    # 將 Goodinfo Cookie 從 secrets 注入環境變數，供 scraper 使用
-    if 'GOODINFO_COOKIE_MY_STOCK' in st.secrets:
-        os.environ['GOODINFO_COOKIE_MY_STOCK'] = st.secrets['GOODINFO_COOKIE_MY_STOCK']
+    # 將 Goodinfo 月營收 Cookie 從 secrets 注入環境變數（我的選股103 已改為本機計算，不需 Cookie）
     if 'GOODINFO_COOKIE_MONTHLY' in st.secrets:
         os.environ['GOODINFO_COOKIE_MONTHLY'] = st.secrets['GOODINFO_COOKIE_MONTHLY']
 except Exception:
@@ -133,32 +132,96 @@ def _batch_kd_analyze(
 # --------------------------------------------------------------------------------
 # OPTIMIZATION: Cached Data Fetching Functions（動態 TTL 版）
 # --------------------------------------------------------------------------------
-@st.cache_data(ttl=market_ttl(300, 3600))   # 盤中5分鐘；盤後1小時
-def cached_scrape_goodinfo():
-    return scrape_goodinfo()
+#
+# 失敗結果不快取：快取函式內遇到失敗一律 raise（st.cache_data 不會快取例外），
+# 外層包裝再轉回原本的 None / 錯誤 dict，讓既有的顯示邏輯不用改。
+# --------------------------------------------------------------------------------
+class _FetchFailed(Exception):
+    """抓取失敗；在 st.cache_data 內 raise，避免 None 被快取住。"""
+
+
+class _AnalyzeFailed(Exception):
+    """個股分析失敗；攜帶 analyze_stock 回傳的錯誤 dict。"""
+    def __init__(self, result: dict):
+        super().__init__(result.get('message', '分析失敗'))
+        self.result = result
+
+
+def _require(result, label: str):
+    if result is None:
+        raise _FetchFailed(f"{label} 抓取失敗")
+    return result
+
+
+@st.cache_data(ttl=market_ttl(1800, 3600), show_spinner=False)   # 盤中30分鐘；盤後1小時
+def _cached_screen_103(params: dict) -> dict:
+    """我的選股103（本機計算）。ScreenerError 直接往外拋，不會被快取。"""
+    res = screen_103(params=Screen103Params(**params))
+    n_cand = len(res.detail) + len(res.errors)
+    if n_cand and len(res.errors) * 2 > n_cand:
+        raise ScreenerError(
+            f"細篩有 {len(res.errors)}/{n_cand} 檔抓不到日線，可能是 FinMind 限流，請稍後再試"
+        )
+    return {
+        'matches': res.matches,
+        'trade_date': res.trade_date,
+        'prev_date': res.prev_date,
+        'source': res.source,
+        'universe_size': res.universe_size,
+        'n_candidates': n_cand,
+        'errors': res.errors,
+    }
 
 @st.cache_data(ttl=market_ttl(1800, 86400))  # 盤中30分鐘；盤後1日
-def cached_scrape_monthly_revenue():
-    return scrape_monthly_revenue()
+def _cached_scrape_monthly_revenue():
+    return _require(scrape_monthly_revenue(), "Goodinfo 月營收")
 
 @st.cache_data(ttl=market_ttl(300, 3600))   # 盤中5分鐘；盤後1小時
-def cached_fetch_concentration_data():
-    return fetch_stock_concentration_data()
+def _cached_fetch_concentration_data():
+    return _require(fetch_stock_concentration_data(), "籌碼集中度")
 
 @st.cache_data(ttl=market_ttl(60, 300))     # 盤中1分鐘；盤後5分鐘
-def cached_scrape_yahoo_rankings(url):
-    return scrape_yahoo_stock_rankings(url)
+def _cached_scrape_yahoo_rankings(url):
+    return _require(scrape_yahoo_stock_rankings(url), "Yahoo 排行榜")
 
 @st.cache_data(ttl=3600)
-def cached_analyze_stock(stock_id: str) -> dict:
+def _cached_analyze_stock(stock_id: str) -> dict:
     """
     改善 4：回傳值中的 chart_figure 已序列化為 JSON 字串，
     避免 Plotly Figure 物件佔用大量快取記憶體。
+    失敗（例如 FinMind 429）時 raise，錯誤結果不進快取，下次會重抓。
     """
     result = analyze_stock(stock_id)
-    if result.get('status') == 'success' and 'chart_figure' in result:
+    if result.get('status') != 'success':
+        raise _AnalyzeFailed(result)
+    if 'chart_figure' in result:
         result['chart_json'] = _fig_to_cache(result.pop('chart_figure'))
     return result
+
+
+def cached_scrape_monthly_revenue():
+    try:
+        return _cached_scrape_monthly_revenue()
+    except _FetchFailed:
+        return None
+
+def cached_fetch_concentration_data():
+    try:
+        return _cached_fetch_concentration_data()
+    except _FetchFailed:
+        return None
+
+def cached_scrape_yahoo_rankings(url):
+    try:
+        return _cached_scrape_yahoo_rankings(url)
+    except _FetchFailed:
+        return None
+
+def cached_analyze_stock(stock_id: str) -> dict:
+    try:
+        return _cached_analyze_stock(stock_id)
+    except _AnalyzeFailed as e:
+        return e.result
 
 @st.cache_data(ttl=86400)
 def cached_plot_revenue(stock_id: str):
@@ -585,73 +648,79 @@ def display_concentration_results():
             st.error("無法獲取籌碼集中度資料。")
 
 
-def display_goodinfo_results():
-    st.header("⭐ 我的選股 結果 (from Goodinfo)")
-    with st.spinner("正在從 Goodinfo! 網站爬取資料..."):
-        scraped_df = cached_scrape_goodinfo()
-    
-    if scraped_df is not None and not scraped_df.empty:
-        st.success(f"成功爬取到 {len(scraped_df)} 筆資料，正在進行技術指標分析...")
+def _describe_103(p: dict) -> str:
+    base = "昨收" if p['red_k_base'] == 'prev_close' else "開盤價"
+    return f"""
+**篩選條件（本機計算，等同 Goodinfo 我的選股103）：**
+1.  紅K棒幅 {p['red_k_min']}% ~ {p['red_k_max']}%（分母：{base}）
+2.  成交張數 {p['vol_min']:,.0f} ~ {p['vol_max']:,.0f} 張
+3.  季線乖離 {p['ma60_dev_min']}% ~ {p['ma60_dev_max']}%
+4.  週K值 {p['wk_min']} ~ {p['wk_max']}
+5.  週K值向上
+6.  月線 < 季線（空頭排列）
+7.  日K > 日D
+8.  今日成交張數 > {p['vol_ratio']} × 昨日成交張數
+"""
 
-        # 並發分析（以 ThreadPoolExecutor 取代逐筆順序呼叫）
-        raw_codes = [str(r.代碼).strip() for r in scraped_df.itertuples()]
-        progress_bar = st.progress(0, text="分析進度")
-        analysis_cache = _batch_kd_analyze(raw_codes, progress_bar, label_prefix="正在分析")
-        progress_bar.empty()
 
-        k_values, d_values, i_values = [], [], []
-        for code in raw_codes:
-            if not code or code == 'nan':
-                k_values.append("N/A"); d_values.append("N/A"); i_values.append("N/A")
-                continue
-            result = analysis_cache.get(code, {'status': 'error', 'message': '分析失敗'})
-            if result['status'] == 'success':
-                indicators = result.get('indicators', {})
-                k_val = indicators.get('k')
-                d_val = indicators.get('d')
-                i_val = indicators.get('i_value')
-                k_values.append(f"{k_val:.2f}" if k_val is not None else "N/A")
-                d_values.append(f"{d_val:.2f}" if d_val is not None else "N/A")
-                i_values.append(i_val if i_val is not None else "N/A")
+def display_my_103_results():
+    st.header("⭐ 我的選股103（本機計算）")
+    params = st.session_state.get('params_103', asdict(Screen103Params()))
+
+    try:
+        with st.spinner("正在抓取全市場行情並計算條件（首次約需 30–60 秒）..."):
+            res = _cached_screen_103(params)
+    except ScreenerError as e:
+        st.error(f"❌ 選股失敗：{e}")
+        st.caption("失敗結果不會被快取，稍後重新按一次按鈕即可重試。")
+        return
+
+    src_label = {'twse+tpex': '證交所 + 櫃買中心', 'finmind': 'FinMind'}.get(res['source'], res['source'])
+    st.caption(
+        f"資料日期：**{res['trade_date']:%Y/%m/%d}**（前一交易日 {res['prev_date']:%Y/%m/%d}）　"
+        f"來源：{src_label}　全市場 {res['universe_size']} 檔 → 粗篩 {res['n_candidates']} 檔"
+    )
+    if res['errors']:
+        with st.expander(f"⚠️ {len(res['errors'])} 檔候選股抓不到日線，未納入判斷"):
+            st.write(res['errors'])
+    st.info(_describe_103(params))
+
+    scraped_df = res['matches'].copy()
+    if scraped_df.empty:
+        st.warning("今天沒有符合全部條件的股票。")
+        return
+
+    st.success(f"共 {len(scraped_df)} 檔符合條件，正在進行技術指標分析...")
+    raw_codes = [str(c).strip() for c in scraped_df['代碼']]
+    progress_bar = st.progress(0, text="分析進度")
+    analysis_cache = _batch_kd_analyze(raw_codes, progress_bar, label_prefix="正在分析")
+    progress_bar.empty()
+
+    # KD 直接用選股計算的日K/日D（與 Goodinfo 同算法）；I 值來自個股分析
+    scraped_df['KD'] = [f"K:{k:.2f} D:{d:.2f}" for k, d in zip(scraped_df['日K'], scraped_df['日D'])]
+    i_values = []
+    for code in raw_codes:
+        result = analysis_cache.get(code, {'status': 'error'})
+        i_val = result.get('indicators', {}).get('i_value') if result['status'] == 'success' else None
+        i_values.append(i_val if i_val is not None else ("錯誤" if result['status'] != 'success' else "N/A"))
+    scraped_df['I值'] = [str(v) for v in i_values]  # 混型別會讓 Arrow 轉換失敗
+
+    display_columns = [
+        '代碼', '名稱', 'KD', 'I值', '市場', '股價日期',
+        '成交', '漲跌價', '漲跌幅', '成交張數', '紅K棒幅', '季線乖離', '週K'
+    ]
+    st.dataframe(scraped_df[[c for c in display_columns if c in scraped_df.columns]])
+
+    for _, stock in scraped_df.iterrows():
+        stock_code = str(stock['代碼']).strip()
+        stock_name = str(stock['名稱']).strip()
+        with st.expander(f"查看 {stock_name} ({stock_code}) 的技術分析圖"):
+            analysis_result = analysis_cache.get(stock_code) or cached_analyze_stock(stock_code)
+            if analysis_result['status'] == 'success':
+                st.plotly_chart(_fig_from_cache(analysis_result['chart_json']), use_container_width=True,
+                                key=f"chart103_{stock_code}")
             else:
-                k_values.append("錯誤"); d_values.append("錯誤"); i_values.append("錯誤")
-
-        scraped_df['KD'] = [f"K:{k} D:{d}" for k, d in zip(k_values, d_values)]
-        scraped_df['I值'] = i_values
-
-        st.info("""
-        **篩選條件 (來自 Goodinfo 自訂篩選):**
-        1.  紅K棒棒幅 > 2.5%
-        2.  成交張數 > 5000張
-        3.  與季線乖離 : -5% ~ 5%
-        4.  週K值範圍 : 0 ~ 50
-        5.  週K值向上
-        6.  季線在月線之上 (空頭排列)
-        7.  日K值 > 日D值
-        8.  今日成交張數 > 1.3 X 昨日成交張數
-        """)
-
-        display_columns = [
-            '代碼', '名稱', 'KD', 'I值', '市場', '股價日期',
-            '成交', '漲跌價', '漲跌幅', '成交張數'
-        ]
-        final_display_columns = [col for col in display_columns if col in scraped_df.columns]
-        st.dataframe(scraped_df[final_display_columns])
-        
-        for _, stock in scraped_df.iterrows():
-            stock_code = str(stock['代碼']).strip()
-            stock_name = str(stock['名稱']).strip()
-            if not stock_code or stock_code == 'nan': continue
-            
-            with st.expander(f"查看 {stock_name} ({stock_code}) 的技術分析圖"):
-                # 直接讀本地快取，不重複呼叫 API
-                analysis_result = analysis_cache.get(stock_code) or cached_analyze_stock(stock_code)
-                if analysis_result['status'] == 'success':
-                    st.plotly_chart(_fig_from_cache(analysis_result['chart_json']), use_container_width=True)
-                else:
-                    show_analysis_error(stock_name, analysis_result)
-    else:
-        st.warning("未爬取到任何資料。請檢查 Cookie 是否有效。")
+                show_analysis_error(stock_name, analysis_result)
 
 
 def display_monthly_revenue_visualization(df: pd.DataFrame):
@@ -1335,14 +1404,8 @@ def main():
 
     # ── 改善 1：側邊欄連線狀態燈號 ──────────────────────────────────────
     st.sidebar.header("🔌 連線狀態")
-    _gi_cookie = os.getenv('GOODINFO_COOKIE_MY_STOCK', '')
     _gi_monthly = os.getenv('GOODINFO_COOKIE_MONTHLY', '')
     _finmind    = os.getenv('FINMIND_API_TOKEN', '')
-
-    if _gi_cookie:
-        st.sidebar.success("✅ Goodinfo 選股 Cookie 已設定")
-    else:
-        st.sidebar.error("⛔ Goodinfo 選股 Cookie 未設定（GOODINFO_COOKIE_MY_STOCK）")
 
     if _gi_monthly:
         st.sidebar.success("✅ Goodinfo 月營收 Cookie 已設定")
@@ -1368,6 +1431,21 @@ def main():
     with st.sidebar.expander("籌碼集中度篩選條件", expanded=False):
         filter_min_vol_conc = st.number_input("最低10日均量（張）", value=2000, step=500, key="fp_conc_vol")
 
+    with st.sidebar.expander("我的選股103 條件", expanded=False):
+        _d = Screen103Params()
+        p103_red = st.slider("紅K棒幅（%）", 0.0, 10.0, (_d.red_k_min, _d.red_k_max), step=0.5, key="p103_red")
+        p103_base = st.radio("棒幅分母", ["prev_close", "open"], horizontal=True, key="p103_base",
+                             format_func=lambda x: "昨收" if x == "prev_close" else "開盤價")
+        p103_vol = st.number_input("最低成交張數", value=int(_d.vol_min), step=500, key="p103_vol")
+        p103_dev = st.slider("季線乖離（%）", -15.0, 15.0, (_d.ma60_dev_min, _d.ma60_dev_max), step=0.5, key="p103_dev")
+        p103_wk = st.slider("週K值上限", 10, 100, int(_d.wk_max), step=5, key="p103_wk")
+        p103_vr = st.slider("量增倍數（今 / 昨）", 1.0, 3.0, _d.vol_ratio, step=0.1, key="p103_vr")
+    st.session_state['params_103'] = asdict(Screen103Params(
+        red_k_min=p103_red[0], red_k_max=p103_red[1], red_k_base=p103_base,
+        vol_min=float(p103_vol), ma60_dev_min=p103_dev[0], ma60_dev_max=p103_dev[1],
+        wk_max=float(p103_wk), vol_ratio=p103_vr,
+    ))
+
     # 把參數存進 session_state，讓 display 函式讀取
     st.session_state['filter_params'] = {
         'min_price':    filter_min_price,
@@ -1380,7 +1458,7 @@ def main():
     st.sidebar.header("選股策略")
     if st.sidebar.button("1日籌碼集中度選股"):
         st.session_state.action = "concentration_pick"
-    if st.sidebar.button("我的選股 (Goodinfo)"):
+    if st.sidebar.button("我的選股103（本機計算）"):
         st.session_state.action = "my_stock_picks"
     if st.sidebar.button("月營收選股 (Goodinfo)"):
         st.session_state.action = "monthly_revenue_pick"
@@ -1406,7 +1484,7 @@ def main():
         if action == "concentration_pick":
             display_concentration_results()
         elif action == "my_stock_picks":
-            display_goodinfo_results()
+            display_my_103_results()
         elif action == "monthly_revenue_pick":
             display_monthly_revenue_results()
         elif action == "rank_listed":
@@ -1417,4 +1495,4 @@ def main():
             display_single_stock_analysis(st.session_state.stock_id)
 
 if __name__ == "__main__":
-    main()
+    main()
