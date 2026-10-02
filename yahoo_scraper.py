@@ -1,13 +1,13 @@
 # yahoo_scraper.py (已修正時區問題)
 
-import time
-import requests
 import pandas as pd
 from bs4 import BeautifulSoup
 from io import StringIO
 import re
 from datetime import datetime
-from zoneinfo import ZoneInfo  # 修正：導入 ZoneInfo 模組
+from zoneinfo import ZoneInfo
+
+from scrape_utils import ScrapeError, fetch_html
 
 
 def _time_to_seconds(t) -> int:
@@ -118,91 +118,101 @@ def _get_volume_factor() -> float:
     return f1 + (now_sec - t1_sec) * (f2 - f1) / (t2_sec - t1_sec)
 
 
-def scrape_yahoo_stock_rankings(url: str) -> pd.DataFrame | None:
+def _parse_rows_primary(soup) -> list[dict]:
+    """原解析法：依 Yahoo 的 atomic CSS class 抓欄位（改版時最容易壞）。"""
+    rows = soup.find_all('li', class_='List(n)')
+    out = []
+    for i, row in enumerate(rows):
+        try:
+            sticky_cell = row.find('div', style='position:sticky;min-width:184px')
+            if not sticky_cell:
+                continue
+            rank_span = sticky_cell.find('span', class_=re.compile(r'Fz\(24px\)'))
+            name = sticky_cell.find('div', class_='Lh(20px) Fw(600) Fz(16px) Ell').text.strip()
+            symbol = sticky_cell.find('span', class_='Fz(14px) C(#979ba7) Ell').text.strip()
+            data_containers = row.find_all('div', class_=lambda x: x and 'Fxg(1)' in x and 'Ta(end)' in x)
+            if len(data_containers) < 8:
+                continue
+            rank = pd.to_numeric(rank_span.text.strip(), errors='coerce') if rank_span else i + 1
+            out.append({
+                'Rank': int(rank),
+                'Stock Symbol': symbol,
+                'Stock Name': name,
+                'Price': pd.to_numeric(data_containers[0].text.strip(), errors='coerce'),
+                'Change Percent': pd.to_numeric(data_containers[2].text.strip().replace('%', ''), errors='coerce'),
+                'Volume (Shares)': pd.to_numeric(data_containers[6].text.strip().replace(',', ''), errors='coerce'),
+            })
+        except Exception as e:                        # noqa: BLE001
+            print(f"處理第 {i+1} 行資料時發生錯誤：{e}")
+    return out
+
+
+_NUM = re.compile(r'^[+-]?[\d,]+(\.\d+)?%?$')
+
+
+def _parse_rows_fallback(soup) -> list[dict]:
+    """
+    備援解析法：不依賴 CSS class，只找「含 /quote/代號 連結的列」，再依數字欄位順序取值
+    （股價、漲跌、漲跌幅、最高、最低、價差、成交量…，與主解析法相同的欄位位置）。
+    """
+    out = []
+    for li in soup.find_all('li'):
+        a = li.find('a', href=re.compile(r'/quote/\d{4,6}'))
+        if not a:
+            continue
+        code = re.search(r'/quote/(\d{4,6})', a['href']).group(1)
+        texts = [t for t in li.stripped_strings]
+        nums = [t for t in texts if _NUM.match(t.replace('▲', '').replace('▼', ''))]
+        name = next((t for t in texts if not _NUM.match(t) and code not in t), code)
+        if len(nums) < 8:
+            continue
+        # 第一個數字可能是名次
+        if len(nums) >= 9 and '.' not in nums[0] and '%' not in nums[0]:
+            rank, nums = int(nums[0].replace(',', '')), nums[1:]
+        else:
+            rank = len(out) + 1
+        clean = lambda t: pd.to_numeric(t.replace(',', '').replace('%', ''), errors='coerce')
+        out.append({'Rank': rank, 'Stock Symbol': code, 'Stock Name': name,
+                    'Price': clean(nums[0]), 'Change Percent': clean(nums[2]),
+                    'Volume (Shares)': clean(nums[6])})
+    return out
+
+
+def scrape_yahoo_stock_rankings(url: str) -> pd.DataFrame:
     """
     通用函式：從指定的 Yahoo 股市排行榜 URL 抓取資料。
+    失敗時 raise ScrapeError（kind：network / blocked / layout / empty）。
     """
     print(f"正在使用 Requests 從 {url} 抓取資料...")
-    
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36'
-    }
+    html = fetch_html(url, label="Yahoo 股市排行榜", timeout=10, encoding='utf-8')
+    soup = BeautifulSoup(html, 'html.parser')
 
-    try:
-        # 最多重試 3 次（指數退避）
-        for _attempt in range(3):
-            res = requests.get(url, headers=headers, timeout=10)
-            if res.status_code == 200:
-                break
-            if _attempt < 2:
-                time.sleep(2 ** _attempt)
-        res.raise_for_status()
-        res.encoding = 'utf-8'
+    all_stocks = _parse_rows_primary(soup)
+    parser = "primary"
+    if not all_stocks:
+        all_stocks = _parse_rows_fallback(soup)
+        parser = "fallback"
+    if not all_stocks:
+        raise ScrapeError("layout", "Yahoo 排行榜頁面中解析不到任何股票列（兩種解析法都失敗），網頁可能改版")
+    if parser == "fallback":
+        print("⚠️ 主解析法失敗，改用備援解析法（Yahoo 可能改版，欄位位置請留意）")
 
-        soup = BeautifulSoup(res.text, 'html.parser')
-        rows = soup.find_all('li', class_='List(n)')
+    df = pd.DataFrame(all_stocks)
+    df = df.dropna(subset=['Price'])
+    if df.empty:
+        raise ScrapeError("empty", "Yahoo 排行榜沒有可用的股價資料")
 
-        if not rows:
-            print("錯誤：找不到股票排名列表的行元素。Yahoo Finance 的網頁結構可能已變更。")
-            return None
-        
-        all_stocks = []
-        for i, row in enumerate(rows):
-            try:
-                sticky_cell = row.find('div', style='position:sticky;min-width:184px')
-                if not sticky_cell: continue
+    factor = _get_volume_factor()
+    print(f"當前時間 {datetime.now(ZoneInfo('Asia/Taipei')).strftime('%H:%M:%S')}，預估成交量因子: {factor:.2f}")
 
-                rank_span = sticky_cell.find('span', class_=re.compile(r'Fz\(24px\)'))
-                name = sticky_cell.find('div', class_='Lh(20px) Fw(600) Fz(16px) Ell').text.strip()
-                symbol = sticky_cell.find('span', class_='Fz(14px) C(#979ba7) Ell').text.strip()
-                
-                data_containers = row.find_all('div', class_=lambda x: x and 'Fxg(1)' in x and 'Ta(end)' in x)
-                if len(data_containers) < 8: continue
+    df['Factor'] = factor
+    df['Volume (Shares)'] = pd.to_numeric(df['Volume (Shares)'], errors='coerce')
+    df['Estimated Volume'] = (df['Volume (Shares)'] * factor).round(0).astype('Int64')
 
-                rank = pd.to_numeric(rank_span.text.strip(), errors='coerce') if rank_span else i + 1
-                price = pd.to_numeric(data_containers[0].text.strip(), errors='coerce')
-                change_percent_str = data_containers[2].text.strip().replace('%', '')
-                change_percent = pd.to_numeric(change_percent_str, errors='coerce')
-                volume_str = data_containers[6].text.strip().replace(',', '')
-                volume = pd.to_numeric(volume_str, errors='coerce')
-                
-                all_stocks.append({
-                    'Rank': int(rank),
-                    'Stock Symbol': symbol,
-                    'Stock Name': name,
-                    'Price': price,
-                    'Change Percent': change_percent,
-                    'Volume (Shares)': volume,
-                })
-            except Exception as e:
-                print(f"處理第 {i+1} 行資料時發生錯誤：{e}")
-                continue
-
-        df = pd.DataFrame(all_stocks)
-        if df.empty:
-            print("未能成功解析任何股票資料。")
-            return None
-            
-        factor = _get_volume_factor()
-        print(f"當前時間 {datetime.now(ZoneInfo('Asia/Taipei')).strftime('%H:%M:%S')}，預估成交量因子: {factor:.2f}")
-        
-        df['Factor'] = factor
-        df['Volume (Shares)'] = pd.to_numeric(df['Volume (Shares)'], errors='coerce')
-        df['Estimated Volume'] = (df['Volume (Shares)'] * factor).round(0).astype('Int64')
-
-        def _extract_digits(x):
-            # 用 search 取第一段連續數字並保留字串格式，避免 int('0056') → 56 截斷前導零
-            m = re.search(r'\d+', str(x))
-            return m.group(0) if m else None
-        df['Stock Symbol'] = df['Stock Symbol'].astype(str).apply(_extract_digits)
-        # 保持字串，顯示與查詢都不需要整數；只在必要時（如 twstock 查詢）外部再轉型
-        df['Stock Symbol'] = df['Stock Symbol'].fillna('')
-
-        return df
-
-    except requests.exceptions.RequestException as e:
-        print(f"網路請求失敗：{e}")
-        return None
-    except Exception as e:
-        print(f"發生未預期的錯誤：{e}")
-        return None
+    def _extract_digits(x):
+        # 用 search 取第一段連續數字並保留字串格式，避免 int('0056') → 56 截斷前導零
+        m = re.search(r'\d+', str(x))
+        return m.group(0) if m else None
+    df['Stock Symbol'] = df['Stock Symbol'].astype(str).apply(_extract_digits).fillna('')
+    df.attrs['parser'] = parser
+    return df

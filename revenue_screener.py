@@ -29,6 +29,7 @@ import re
 import sys
 import time
 from dataclasses import dataclass, field
+from functools import lru_cache
 from datetime import date, timedelta
 from typing import Callable
 
@@ -127,6 +128,7 @@ def _fetch_mops_file(path: str, problems: list) -> pd.DataFrame | None:
     return None
 
 
+@lru_cache(maxsize=128)
 def fetch_mops_month(year: int, month: int) -> pd.DataFrame:
     """
     抓某年月的上市＋上櫃營收彙總（國內 _0 ＋ KY _1；較早年份沒有分檔時改抓無後綴檔名）。
@@ -365,6 +367,20 @@ def diagnose(codes: list[str], as_of=None, p: RevenueParams | None = None) -> No
                                RevenueParams(top_n=999))          # 不提早停止，算出完整名次
         rk, yrs = int(one.at[0, "same_month_rank"]), int(one.at[0, "years_compared"])
         print(f"  {'✓' if rk <= p.top_n else '✗'} 6 歷年同期排名: {rk} / {yrs} 年")
+        # 列出歷年同月營收，方便和 Goodinfo 個股月營收頁對照
+        y, m = divmod(lym, 100)
+        series = {y: r["revenue"], y - 1: r["rev_last_year"]}
+        for yy in range(y - 2, y - 30, -2):
+            h = fetch_mops_month(yy, m)            # 已快取，不會重抓
+            if h.empty:
+                continue
+            h = h.set_index("code")
+            if code in h.index:
+                series.setdefault(yy, h.at[code, "revenue"])
+                series.setdefault(yy - 1, h.at[code, "rev_last_year"])
+        top = sorted(((v, k) for k, v in series.items() if pd.notna(v)), reverse=True)[:6]
+        print("    歷年同月營收前 6（億）：" +
+              "、".join(f"{k}/{m:02d}={v / 1e8:.2f}" for v, k in top))
 
 
 def _main():

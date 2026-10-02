@@ -1,101 +1,79 @@
 # 1日籌碼集中度.py (已修改欄位顯示)
 
-import time
-import requests
 import pandas as pd
 from io import StringIO
 from bs4 import BeautifulSoup
 
-def fetch_stock_concentration_data():
+from scrape_utils import ScrapeError, fetch_html
+
+REQUIRED_COLUMNS = ['代碼', '5日集中度', '10日集中度', '20日集中度', '10日均量']
+
+
+def fetch_stock_concentration_data() -> pd.DataFrame:
     """
     爬取股票籌碼集中度資料並進行數據清理。
-    此版本使用 BeautifulSoup 增強解析的穩定性。
-    
+
     Returns:
-        pd.DataFrame or None: 清理後的股票集中度資料，或在發生錯誤時返回 None。
+        pd.DataFrame: 清理後的股票集中度資料。
+    Raises:
+        ScrapeError: 連線失敗／被擋／網頁改版／沒有資料（kind 欄位標示原因）。
     """
     url = 'http://asp.peicheng.com.tw/main/report/dream_report/%E7%B1%8C%E7%A2%BC%E9%9B%86%E4%B8%AD%E5%BA%A61%E6%97%A5%E6%8E%92%E8%A1%8C.htm'
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9',
-        'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7',
-        'Connection': 'keep-alive',
-    }
+    html = fetch_html(url, label="籌碼集中度網站（peicheng）", encoding='big5')
 
+    soup = BeautifulSoup(html, 'lxml')
+    target_table = soup.select_one(r'#籌碼集中度排行轉網頁\.\(排程\)_3148')
     try:
-        # 最多重試 3 次（指數退避）
-        for _attempt in range(3):
-            response = requests.get(url, headers=headers, timeout=20)
-            if response.status_code == 200:
-                break
-            if _attempt < 2:
-                time.sleep(2 ** _attempt)
-        response.raise_for_status()
-        response.encoding = 'big5'
-
-        soup = BeautifulSoup(response.text, 'lxml')
-        target_table = soup.select_one(r'#籌碼集中度排行轉網頁\.\(排程\)_3148')
-
-        if not target_table:
-            print("錯誤：使用 BeautifulSoup 找不到指定的表格 ID。網站結構可能已變更。")
-            dfs = pd.read_html(StringIO(response.text))
-        else:
+        if target_table is not None:
             dfs = pd.read_html(StringIO(str(target_table)), flavor='lxml')
+        else:
+            # 表格 ID 變了：改從整頁所有表格中找含「代碼」的那一張
+            print("警告：找不到指定的表格 ID，改為掃描整頁表格。")
+            dfs = [t for t in pd.read_html(StringIO(html)) if '代碼' in t.to_string()]
+    except ValueError:                              # pandas: No tables found
+        dfs = []
+    if not dfs:
+        raise ScrapeError("layout", "籌碼集中度網頁中找不到含「代碼」的表格")
 
-        if not dfs:
-            print("錯誤：pandas 無法從 HTML 中解析出任何表格。")
-            return None
+    df0 = dfs[0]
+    df0.columns = df0.columns.get_level_values(0)
 
-        df0 = dfs[0]
-        df0.columns = df0.columns.get_level_values(0)
-        
-        header_row_index = -1
-        for i, row in df0.iterrows():
-            if '代碼' in str(row.to_string()):
-                header_row_index = i
-                break
-        
-        if header_row_index == -1:
-            print("錯誤：在表格中找不到包含 '代碼' 的標頭行。")
-            return None
+    header_row_index = -1
+    for i, row in df0.iterrows():
+        if '代碼' in str(row.to_string()):
+            header_row_index = i
+            break
+    if header_row_index == -1:
+        raise ScrapeError("layout", "籌碼集中度表格中找不到「代碼」標頭列")
 
-        df1 = df0.iloc[header_row_index + 1:].copy()
-        df1.columns = df0.iloc[header_row_index].values
-        df1.reset_index(drop=True, inplace=True)
+    df1 = df0.iloc[header_row_index + 1:].copy()
+    df1.columns = df0.iloc[header_row_index].values
+    df1.reset_index(drop=True, inplace=True)
 
-        last_valid_index = df1['代碼'].apply(pd.to_numeric, errors='coerce').last_valid_index()
-        if last_valid_index is not None:
-            df1 = df1.iloc[:last_valid_index + 1]
+    # 修正可能的命名差異 (例如 "股票名稱" vs "名稱")
+    if '名稱' in df1.columns and '股票名稱' not in df1.columns:
+        df1.rename(columns={'名稱': '股票名稱'}, inplace=True)
 
-        # 確保所有需要的欄位都存在
-        all_columns = ['編號', '代碼', '股票名稱', '1日集中度', '5日集中度', '10日集中度', '20日集中度', '60日集中度', '120日集中度', '10日均量']
-        # 修正可能的命名差異 (例如 "股票名稱" vs "名稱")
-        if '名稱' in df1.columns and '股票名稱' not in df1.columns:
-            df1.rename(columns={'名稱': '股票名稱'}, inplace=True)
-        # 啟用欄位存在性檢查（原為死程式碼），方便偵測資料源結構變動
-        missing_cols = [c for c in all_columns if c not in df1.columns]
-        if missing_cols:
-            print(f"警告：缺少預期欄位 {missing_cols}，資料源結構可能已變動。")
-            
-        numeric_columns = ['1日集中度', '5日集中度', '10日集中度', '20日集中度', '60日集中度', '120日集中度', '10日均量']
-        for col in numeric_columns:
-            if col in df1.columns:
-                df1[col] = pd.to_numeric(df1[col], errors='coerce')
-        
-        df1.dropna(subset=numeric_columns, inplace=True)
-        
-        print("籌碼集中度資料獲取並清理成功。")
-        return df1
+    missing = [c for c in REQUIRED_COLUMNS if c not in df1.columns]
+    if missing:
+        raise ScrapeError("layout", f"籌碼集中度表格缺少欄位 {missing}；目前欄位：{list(df1.columns)[:15]}")
 
-    except requests.exceptions.Timeout:
-        print(f"錯誤：請求超時。目標網站 '{url}' 回應過慢。")
-        return None
-    except requests.exceptions.RequestException as e:
-        print(f"錯誤：爬取網頁時發生網路錯誤: {e}")
-        return None
-    except Exception as e:
-        print(f"錯誤：處理資料時發生未知錯誤: {e}")
-        return None
+    last_valid_index = df1['代碼'].apply(pd.to_numeric, errors='coerce').last_valid_index()
+    if last_valid_index is not None:
+        df1 = df1.iloc[:last_valid_index + 1]
+
+    numeric_columns = ['1日集中度', '5日集中度', '10日集中度', '20日集中度', '60日集中度', '120日集中度', '10日均量']
+    numeric_columns = [c for c in numeric_columns if c in df1.columns]
+    for col in numeric_columns:
+        df1[col] = pd.to_numeric(df1[col], errors='coerce')
+    df1 = df1.dropna(subset=numeric_columns)
+
+    if df1.empty:
+        raise ScrapeError("empty", "籌碼集中度表格沒有任何有效資料（網站可能尚未更新）")
+
+    print(f"籌碼集中度資料獲取並清理成功，共 {len(df1)} 筆。")
+    return df1
+
 
 def filter_stock_data(df, min_volume=2000):
     """
@@ -132,7 +110,11 @@ def filter_stock_data(df, min_volume=2000):
 if __name__ == '__main__':
     """用於獨立測試腳本"""
     print("正在獲取籌碼集中度資料...")
-    stock_data = fetch_stock_concentration_data()
+    try:
+        stock_data = fetch_stock_concentration_data()
+    except ScrapeError as e:
+        print(f"失敗：{e}")
+        stock_data = None
 
     if stock_data is not None:
         print("\n資料獲取成功，開始篩選股票...")
@@ -144,4 +126,4 @@ if __name__ == '__main__':
         elif filtered_stocks is not None:
             print("\n沒有找到符合篩選條件的股票。")
         else:
-            print("\n篩選過程中發生錯誤。")
+            print("\n篩選過程中發生錯誤。")

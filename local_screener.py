@@ -601,6 +601,9 @@ def screen_103(trade_date=None, params: Screen103Params | None = None, source: s
             "日K": hit["day_k"].round(2),
             "日D": hit["day_d"].round(2),
             "週K": hit["week_k"].round(2),
+            "週K變化": (hit["week_k"] - hit["week_k_prev"]).round(2),
+            "月季線差(%)": ((hit["ma20"] / hit["ma60"] - 1) * 100).round(2),
+            "量比": (hit["vol_lots"] / hit["prev_vol_lots"]).round(2),
         }).reset_index(drop=True)
     print(f"[103] 符合全部條件：{len(matches)} 檔")
     return ScreenResult(matches, detail, d0, d1, src, len(mkt), errors, notes)

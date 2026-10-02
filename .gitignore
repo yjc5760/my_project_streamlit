@@ -11,3 +11,6 @@ venv/
 # 本機輸出
 *.csv
 .streamlit/secrets.toml
+
+# 上次成功結果（last-known-good）
+.cache/

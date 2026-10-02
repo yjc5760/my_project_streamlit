@@ -7,6 +7,7 @@ import twstock
 from datetime import date, timedelta
 
 from indicators import tw_kd
+from viz import (I_STYLES, NEUTRAL_COLOR, REF_LINE, SERIES, DOWN_COLOR, UP_COLOR)
 
 # --- 新增 Plotly 相關導入 ---
 import plotly.graph_objects as go
@@ -204,9 +205,12 @@ class TaiwanStockAnalyzer:
         dev = self.indicators['dev_1_20']
         return np.where(dev >= 5, 4, np.where(dev <= -5, -4, np.nan))
 
-    def create_chart(self) -> go.Figure:
+    def create_chart(self, visible_days: int = 126) -> go.Figure:
         """
-        【重大修改】使用 Plotly 創建互動式圖表，並返回圖表物件。
+        使用 Plotly 建立互動式技術分析圖。
+        - 紅漲綠跌（K 線、成交量、MACD 柱）；線條系列用藍／琥珀／紫，不和漲跌混色
+        - 略過週末與國定假日（資料中沒有的交易日）
+        - 預設顯示最近 visible_days 根（約 6 個月），雙擊圖表可看全部
         """
         df = self.price_data.copy()
         for key, value in self.indicators.items():
@@ -217,68 +221,118 @@ class TaiwanStockAnalyzer:
         if df.empty or len(df) < 20:
             raise ValueError(f"股票 {self.stock_id} 有效資料不足（dropna 後僅剩 {len(df)} 筆），無法繪圖。")
 
+        blue, amber, violet = SERIES
+        up = df['Close'] >= df['Close'].shift(1).fillna(df['Open'])
+
+        titles = [
+            '股價與均線（藍 週5／琥珀 月20／紫 季60）',
+            '成交量（紅漲綠跌）',
+            'KD（藍 K／琥珀 D；● 超買 ≥80、超賣 ≤20）',
+            '乖離率 %（藍 週-月／琥珀 月-季／紫 週-季）',
+            '訊號（柱：階梯 I 值，紅多綠空；● 乖離 J；線：多空 K）',
+            'MACD（柱：紅正綠負；藍 MACD／琥珀 Signal）',
+            '加權均線（藍 5WMA／琥珀 10WMA）',
+        ]
         fig = make_subplots(
-            rows=7, cols=1,
-            shared_xaxes=True,
-            vertical_spacing=0.03,
-            row_heights=[0.4, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
+            rows=7, cols=1, shared_xaxes=True, vertical_spacing=0.035,
+            row_heights=[0.34, 0.11, 0.11, 0.11, 0.11, 0.11, 0.11],
+            subplot_titles=titles,
         )
 
-        # 1. K線圖和均線
-        fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='K線'), row=1, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=df['sma5'], mode='lines', name='週線(5)', line=dict(color='blue', width=1)), row=1, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=df['sma20'], mode='lines', name='月線(20)', line=dict(color='orange', width=1)), row=1, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=df['sma60'], mode='lines', name='季線(60)', line=dict(color='red', width=1)), row=1, col=1)
-        
-        # 2. 成交量
-        fig.add_trace(go.Bar(x=df.index, y=df['Volume'], name='成交量', marker_color='grey'), row=2, col=1)
+        # 1. K線和均線（只有這一列進圖例）
+        fig.add_trace(go.Candlestick(
+            x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'],
+            name='K線', increasing=dict(line=dict(color=UP_COLOR), fillcolor=UP_COLOR),
+            decreasing=dict(line=dict(color=DOWN_COLOR), fillcolor=DOWN_COLOR),
+        ), row=1, col=1)
+        for col_, name, color in [('sma5', '週線(5)', blue), ('sma20', '月線(20)', amber),
+                                  ('sma60', '季線(60)', violet)]:
+            fig.add_trace(go.Scatter(x=df.index, y=df[col_], mode='lines', name=name,
+                                     line=dict(color=color, width=1.5)), row=1, col=1)
 
-        # 3. KD指標
-        fig.add_trace(go.Scatter(x=df.index, y=df['k'], mode='lines', name='K值', line=dict(color='red', width=1)), row=3, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=df['d'], mode='lines', name='D值', line=dict(color='green', width=1)), row=3, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=df['L_value'], mode='markers', name='KD訊號', marker=dict(color='blue', size=8)), row=3, col=1)
+        # 2. 成交量（依當日漲跌上色，單位：張）
+        fig.add_trace(go.Bar(x=df.index, y=df['Volume'] / 1000, name='成交量(張)', showlegend=False,
+                             marker_color=np.where(up, UP_COLOR, DOWN_COLOR),
+                             hovertemplate='%{y:,.0f} 張<extra>成交量</extra>'), row=2, col=1)
+
+        # 3. KD
+        fig.add_trace(go.Scatter(x=df.index, y=df['k'], mode='lines', name='K', showlegend=False,
+                                 line=dict(color=blue, width=1.5)), row=3, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df['d'], mode='lines', name='D', showlegend=False,
+                                 line=dict(color=amber, width=1.5)), row=3, col=1)
+        kd_sig = df['L_value']
+        fig.add_trace(go.Scatter(
+            x=df.index, y=kd_sig, mode='markers', name='KD訊號', showlegend=False,
+            marker=dict(size=7, color=np.where(kd_sig >= 80, UP_COLOR, DOWN_COLOR)),
+            hovertemplate='%{y:.0f}<extra>KD 超買/超賣</extra>'), row=3, col=1)
+        for lvl in (20, 80):
+            fig.add_hline(y=lvl, row=3, col=1, **REF_LINE)
 
         # 4. 乖離率
-        fig.add_trace(go.Scatter(x=df.index, y=df['dev_5_20'], mode='lines', name='週-月', line=dict(color='red', width=1)), row=4, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=df['dev_20_60'], mode='lines', name='月-季', line=dict(color='green', width=1)), row=4, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=df['dev_5_60'], mode='lines', name='週-季', line=dict(color='orange', width=1)), row=4, col=1)
+        for col_, name, color in [('dev_5_20', '週-月', blue), ('dev_20_60', '月-季', amber),
+                                  ('dev_5_60', '週-季', violet)]:
+            fig.add_trace(go.Scatter(x=df.index, y=df[col_], mode='lines', name=name, showlegend=False,
+                                     line=dict(color=color, width=1.5)), row=4, col=1)
+        fig.add_hline(y=0, row=4, col=1, **REF_LINE)
 
-        # 5. 訊號
-        fig.add_trace(go.Bar(x=df.index, y=df['I_value'], name='階梯訊號', marker_color='red'), row=5, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=df['J_value'], mode='markers', name='乖離訊號', marker=dict(color='blue', size=8)), row=5, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=df['K_value'], mode='lines', name='多空訊號', line=dict(color='orange', width=2)), row=5, col=1)
+        # 5. 訊號：I 值柱依 -3～+3 上色
+        i_vals = pd.Series(df['I_value']).round()
+        i_colors = [I_STYLES.get(int(v), (None, NEUTRAL_COLOR))[1] if pd.notna(v) else NEUTRAL_COLOR
+                    for v in i_vals]
+        fig.add_trace(go.Bar(x=df.index, y=df['I_value'], name='階梯訊號 I', showlegend=False,
+                             marker_color=i_colors,
+                             hovertemplate='I = %{y:.0f}<extra></extra>'), row=5, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df['J_value'], mode='markers', name='乖離訊號 J',
+                                 showlegend=False, marker=dict(color=violet, size=7)), row=5, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df['K_value'], mode='lines', name='多空訊號 K',
+                                 showlegend=False, line=dict(color=blue, width=1.5)), row=5, col=1)
 
         # 6. MACD
-        colors = ['red' if val >= 0 else 'green' for val in df['macd_hist']]  # 正值紅色(多頭)，負值綠色(空頭)
-        fig.add_trace(go.Bar(x=df.index, y=df['macd_hist'], name='Histogram', marker_color=colors), row=6, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=df['macd'], mode='lines', name='MACD', line=dict(color='blue', width=1)), row=6, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=df['macd_signal'], mode='lines', name='Signal', line=dict(color='red', width=1)), row=6, col=1)
-        
+        fig.add_trace(go.Bar(x=df.index, y=df['macd_hist'], name='Histogram', showlegend=False,
+                             marker_color=np.where(df['macd_hist'] >= 0, UP_COLOR, DOWN_COLOR)),
+                      row=6, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df['macd'], mode='lines', name='MACD', showlegend=False,
+                                 line=dict(color=blue, width=1.5)), row=6, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df['macd_signal'], mode='lines', name='Signal',
+                                 showlegend=False, line=dict(color=amber, width=1.5)), row=6, col=1)
+
         # 7. WMA
-        fig.add_trace(go.Scatter(x=df.index, y=df['wma5'], mode='lines', name='5WMA', line=dict(color='red', width=1.5)), row=7, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=df['wma10'], mode='lines', name='10WMA', line=dict(color='green', width=1.5)), row=7, col=1)
-        
-        # 更新整體佈局
+        fig.add_trace(go.Scatter(x=df.index, y=df['wma5'], mode='lines', name='5WMA', showlegend=False,
+                                 line=dict(color=blue, width=1.5)), row=7, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df['wma10'], mode='lines', name='10WMA', showlegend=False,
+                                 line=dict(color=amber, width=1.5)), row=7, col=1)
+
+        # 略過週末與國定假日：工作日中沒有交易資料的日期一律隱藏
+        all_bdays = pd.bdate_range(df.index.min(), df.index.max())
+        holidays = all_bdays.difference(df.index)
+        fig.update_xaxes(
+            rangebreaks=[dict(bounds=["sat", "mon"]),
+                         dict(values=holidays.strftime('%Y-%m-%d').tolist())],
+            tickformat='%Y-%m-%d',
+        )
+
+        # 預設只看最近 visible_days 根；價格與成交量的 y 軸依可見範圍設定
+        win = df.iloc[-min(visible_days, len(df)):]
+        x0 = win.index[0] - pd.Timedelta(days=1)
+        x1 = df.index[-1] + pd.Timedelta(days=1)
+        fig.update_xaxes(range=[x0, x1])
+        lo = min(win['Low'].min(), win[['sma5', 'sma20', 'sma60']].min().min())
+        hi = max(win['High'].max(), win[['sma5', 'sma20', 'sma60']].max().max())
+        pad = (hi - lo) * 0.05
+        fig.update_yaxes(range=[lo - pad, hi + pad], row=1, col=1)
+        fig.update_yaxes(range=[0, (win['Volume'].max() / 1000) * 1.1], row=2, col=1)
+        fig.update_yaxes(range=[0, 100], row=3, col=1)
+
         fig.update_layout(
             title=f'{self.stock_name} ({self.stock_id}) 技術分析圖',
-            height=1200,
+            height=1300,
             xaxis_rangeslider_visible=False,
+            hovermode='x unified',
             showlegend=True,
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+            legend=dict(orientation="h", yanchor="bottom", y=1.015, xanchor="left", x=0),
+            margin=dict(t=110),
         )
-        fig.update_xaxes(
-            rangebreaks=[dict(bounds=["sat", "mon"])], # 隱藏週末
-            tickformat='%Y-%m-%d'
-        )
-        # 更新y軸標題
-        fig.update_yaxes(title_text="股價", row=1, col=1)
-        fig.update_yaxes(title_text="成交量", row=2, col=1)
-        fig.update_yaxes(title_text="KD", row=3, col=1)
-        fig.update_yaxes(title_text="乖離(%)", row=4, col=1)
-        fig.update_yaxes(title_text="訊號", row=5, col=1)
-        fig.update_yaxes(title_text="MACD", row=6, col=1)
-        fig.update_yaxes(title_text="WMA", row=7, col=1)
-        
+        fig.update_annotations(font_size=12)    # 子圖標題
         return fig
 
 

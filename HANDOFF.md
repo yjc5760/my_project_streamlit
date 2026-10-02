@@ -113,3 +113,14 @@ def match_103(d, w):          # d: 日線, w: 週線（皆含 k, d 欄）
 - [ ] 已知限制：查歷史日期時 TPEx 拿不到當日行情，上櫃部分會報錯；做歷史比對腳本前需找可查歷史的 TPEx 端點，或上櫃改全用 FinMind
 - [ ] 與 Goodinfo 歷史結果比對：紅K棒幅分母、週 KD 是否含未收完的本週
 - [ ] 問題 2、3、4、7、8
+
+## 8. 進度（2026-10-02 Cowork，第二階段）
+
+- [x] 月營收選股改本機計算：`revenue_screener.py`（公開資訊觀測站彙總表；當月＝全市場最新公告月份，同 Goodinfo 26M09；同期排名比對 2001 年至今）
+- [ ] 月營收與 Goodinfo 10/02 比對：我們 10+ 檔、Goodinfo 2 檔（皆在我們結果內），多出的股票條件與同期排名皆通過，推測為 Goodinfo 尚未收錄當天公告的 9 月營收 → 待 10/12 公告截止後再比對
+- [x] 套件版本固定（requirements.txt），`use_container_width` 全改 `width="stretch"`
+- [x] 刪除 `scraper.py`、`monthly_revenue_scraper.py`；Streamlit Secrets 的兩個 GOODINFO_COOKIE 可移除
+- [x] README 重寫
+- [x] 上次成功結果（`scrape_utils.lkg_*`，存 `.cache/last_good/`）：選股103、月營收、籌碼集中度、Yahoo 排行失敗時顯示上次結果
+- [x] 籌碼集中度、Yahoo 爬蟲改為 raise `ScrapeError`（連線／被擋／改版／無資料），Yahoo 加備援解析
+- [ ] `streamlit_app.py` 拆多頁（暫緩）
