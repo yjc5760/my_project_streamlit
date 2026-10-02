@@ -89,6 +89,7 @@ class ScreenResult:
     source: str                      # 'twse+tpex' 或 'finmind'
     universe_size: int               # 粗篩前的股票數
     errors: dict = field(default_factory=dict)   # 細篩抓資料失敗的代碼 → 訊息
+    notes: list = field(default_factory=list)    # 資料來源降級等提示
 
 
 # ---------------------------------------------------------------------------
@@ -120,21 +121,33 @@ def _to_date(d) -> date:
     return datetime.strptime(str(d), "%Y-%m-%d").date()
 
 
-def _get_json(url: str, params: dict | None = None, timeout: int = 20, retries: int = 3) -> dict:
+def _get_json(url: str, params: dict | None = None, timeout: int = 20, retries: int = 3,
+              method: str = "GET") -> dict:
     last = None
     for i in range(retries):
         try:
-            r = requests.get(url, params=params, headers={"User-Agent": UA}, timeout=timeout)
+            if method == "POST":
+                r = requests.post(url, data=params, headers={"User-Agent": UA}, timeout=timeout)
+            else:
+                r = requests.get(url, params=params, headers={"User-Agent": UA}, timeout=timeout)
             if r.status_code == 429 and i < retries - 1:
                 time.sleep(2 ** i)
                 continue
             r.raise_for_status()
-            return r.json()
-        except (requests.RequestException, ValueError) as e:
+            try:
+                return r.json()
+            except ValueError:
+                snippet = re.sub(r"\s+", " ", r.text[:150])
+                raise ScreenerError(f"非 JSON 回應（{r.status_code}, "
+                                    f"{r.headers.get('Content-Type', '?')}）：{snippet}")
+        except ScreenerError as e:
+            last = e
+            break                                      # 格式問題，重試無用
+        except requests.RequestException as e:
             last = e
             if i < retries - 1:
                 time.sleep(1 + i)
-    raise ScreenerError(f"連線失敗 {url}: {last}")
+    raise ScreenerError(f"{method} {url}: {last}")
 
 
 def _finmind(params: dict) -> pd.DataFrame:
@@ -237,36 +250,78 @@ def parse_tpex_daily(js: dict) -> pd.DataFrame:
     return pd.DataFrame()
 
 
+def response_date(js: dict) -> date | None:
+    """
+    從 TWSE / TPEx 回應中找出資料日期（'20261002'、'2026/10/02'、'115/10/02' 皆可）。
+    找不到時回傳 None。用來防止端點忽略 date 參數、回傳別天資料。
+    """
+    cands = [js.get("date"), js.get("reportDate")]
+    for t in js.get("tables") or []:
+        if isinstance(t, dict):
+            cands.append(t.get("date"))
+    for c in cands:
+        if not c:
+            continue
+        digits = re.findall(r"\d+", str(c))
+        try:
+            if len(digits) == 1 and len(digits[0]) == 8:
+                v = digits[0]
+                return date(int(v[:4]), int(v[4:6]), int(v[6:]))
+            if len(digits) >= 3:
+                y, m, dd = int(digits[0]), int(digits[1]), int(digits[2])
+                return date(y + 1911 if y < 1911 else y, m, dd)
+        except ValueError:
+            continue
+    return None
+
+
+def _check_date(js: dict, d: date, label: str) -> None:
+    got = response_date(js)
+    if got is not None and got != d:
+        raise ScreenerError(f"{label} 回傳的是 {got} 的資料，不是要求的 {d}（端點可能忽略日期參數）")
+
+
 def fetch_twse_day(d: date) -> pd.DataFrame:
     js = _get_json("https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX",
                    {"date": d.strftime("%Y%m%d"), "type": "ALLBUT0999", "response": "json"})
-    return parse_twse_mi_index(js)
+    df = parse_twse_mi_index(js)
+    if not df.empty:
+        _check_date(js, d, "TWSE")
+    return df
 
 
 def fetch_tpex_day(d: date) -> pd.DataFrame:
-    try:
-        js = _get_json("https://www.tpex.org.tw/www/zh-tw/afterTrading/dailyQ",
-                       {"date": d.strftime("%Y/%m/%d"), "response": "json"})
+    """
+    依序嘗試 TPEx 新版／舊版端點與不同日期格式；每次都檢查回傳的資料日期，
+    避免端點忽略 date 參數時把「今天」的資料當成「昨天」用（會讓量增條件全部失敗）。
+    """
+    roc = f"{d.year - 1911}/{d:%m/%d}"
+    old = "https://www.tpex.org.tw/web/stock/aftertrading/daily_close_quotes/stk_quote_result.php"
+    # 2026-10 實測：dailyQ 為 404；舊端點忽略日期參數，只給最新一個交易日
+    # （歷史日期會被下方日期檢查擋下，由呼叫端改用 FinMind 日線判斷量增）
+    attempts = [
+        ("GET", old, {"l": "zh-tw", "d": roc, "o": "json"}),
+    ]
+    problems = []
+    for method, url, params in attempts:
+        try:
+            js = _get_json(url, params, method=method, retries=2)
+        except ScreenerError as e:
+            problems.append(str(e))
+            continue
         df = parse_tpex_daily(js)
-        if not df.empty:
-            return df
-    except ScreenerError:
-        pass
-    roc = f"{d.year - 1911}/{d:%m/%d}"                 # 舊版端點（民國日期）
-    js = _get_json("https://www.tpex.org.tw/web/stock/aftertrading/daily_close_quotes/stk_quote_result.php",
-                   {"l": "zh-tw", "d": roc, "o": "json"})
-    return parse_tpex_daily(js)
-
-
-def _official_market_day(d: date) -> pd.DataFrame:
-    twse = fetch_twse_day(d)
-    if twse.empty:
-        return twse                                   # 休市
-    time.sleep(0.5)
-    tpex = fetch_tpex_day(d)
-    if tpex.empty:
-        raise ScreenerError(f"TWSE 有 {d} 的資料，但 TPEx 沒有（端點可能改版）")
-    return pd.concat([twse, tpex], ignore_index=True)
+        if df.empty:
+            problems.append(f"{method} {url.rsplit('/', 1)[-1]} {params}: 無資料")
+            continue
+        got = response_date(js)
+        if got is not None and got != d:
+            problems.append(f"{method} {url.rsplit('/', 1)[-1]} {params}: 回傳 {got} 的資料")
+            continue
+        df.attrs["tpex_endpoint"] = f"{method} {url} {params} (回應日期 {got})"
+        return df
+    if all("無資料" in p for p in problems):
+        return pd.DataFrame()                          # 休市
+    raise ScreenerError(f"TPEx 取不到 {d} 的資料：" + "；".join(problems))
 
 
 # ---------------------------------------------------------------------------
@@ -308,7 +363,7 @@ def load_two_days(trade_date: date | None, source: str = "auto",
             found = []
             d = start
             for _ in range(max_back):
-                df = _official_market_day(d)
+                df = fetch_twse_day(d)
                 if not df.empty:
                     found.append((d, df))
                     if len(found) == 2:
@@ -317,8 +372,24 @@ def load_two_days(trade_date: date | None, source: str = "auto",
                 time.sleep(0.5)
             if len(found) < 2:
                 raise ScreenerError(f"{max_back} 天內找不到兩個交易日的官方資料")
-            (d0, today), (d1, prev) = found
-            return _merge_two(today, prev), d0, d1, "twse+tpex"
+            (d0, tw0), (d1, tw1) = found
+
+            otc0 = fetch_tpex_day(d0)                  # 當日上櫃一定要有
+            if otc0.empty:
+                raise ScreenerError(f"TWSE 有 {d0} 的資料，但 TPEx 沒有")
+            notes = []
+            time.sleep(0.5)
+            try:
+                otc1 = fetch_tpex_day(d1)
+            except ScreenerError as e:
+                # TPEx 歷史日期查不到時，上櫃的「量增」改在細篩用 FinMind 日線判斷
+                otc1 = pd.DataFrame(columns=otc0.columns)
+                notes.append(f"上櫃前一日（{d1}）行情取不到，上櫃股的量增條件改用 FinMind 日線判斷。"
+                             f"原因：{e}")
+            mkt = _merge_two(pd.concat([tw0, otc0], ignore_index=True),
+                             pd.concat([tw1, otc1], ignore_index=True))
+            mkt.attrs["notes"] = notes
+            return mkt, d0, d1, "twse+tpex"
         except ScreenerError as e:
             errors.append(f"官方來源：{e}")
             if source == "official":
@@ -345,13 +416,20 @@ def _merge_two(today: pd.DataFrame, prev: pd.DataFrame) -> pd.DataFrame:
     t = today[cols].copy()
     p = prev[["code", "close", "volume"]].rename(columns={"close": "prev_close_raw",
                                                           "volume": "prev_volume"})
-    m = t.merge(p, on="code", how="inner")
+    m = t.merge(p, on="code", how="left")         # 前一日缺資料時 prev_volume 為 NaN（量增延到細篩）
     m = m[m["code"].astype(str).str.match(_COMMON_STOCK)]
     # 昨收優先用「今收 − 漲跌」（= 參考價，除權息日也正確），否則用昨日收盤
     ref = m["close"] - m["change"]
     m["prev_close"] = ref.where(ref.notna() & (ref > 0), m["prev_close_raw"])
     m["change"] = m["change"].where(m["change"].notna(), m["close"] - m["prev_close"])
-    return m.drop(columns="prev_close_raw").reset_index(drop=True)
+    m = m.drop(columns="prev_close_raw").reset_index(drop=True)
+
+    # 防呆：某個市場「今日量 == 昨日量」的比例過高，代表兩天抓到同一份資料
+    for mk, g in m.groupby("market"):
+        traded = g[(g["volume"] > 0) & g["prev_volume"].notna()]
+        if len(traded) >= 50 and (traded["volume"] == traded["prev_volume"]).mean() > 0.5:
+            raise ScreenerError(f"{mk}的當日與前一日成交量幾乎完全相同，前一日資料可能抓錯日期")
+    return m
 
 
 def red_k_pct(open_, close, prev_close, base: str) -> pd.Series | float:
@@ -362,13 +440,14 @@ def red_k_pct(open_, close, prev_close, base: str) -> pd.Series | float:
 
 def coarse_screen(mkt: pd.DataFrame, p: Screen103Params) -> pd.DataFrame:
     """條件 1、2、8。回傳附上計算欄位的候選股。"""
-    df = mkt.dropna(subset=["open", "close", "prev_close", "volume", "prev_volume"]).copy()
+    df = mkt.dropna(subset=["open", "close", "prev_close", "volume"]).copy()
     df["red_k"] = red_k_pct(df["open"], df["close"], df["prev_close"], p.red_k_base)
     df["vol_lots"] = df["volume"] / 1000
     df["prev_vol_lots"] = df["prev_volume"] / 1000
     c1 = df["red_k"].between(p.red_k_min, p.red_k_max)
     c2 = df["vol_lots"].between(p.vol_min, p.vol_max)
-    c8 = df["vol_lots"] > p.vol_ratio * df["prev_vol_lots"]
+    df["c8_deferred"] = df["prev_volume"].isna()          # 沒有前一日量 → 細篩再判斷
+    c8 = df["c8_deferred"] | (df["vol_lots"] > p.vol_ratio * df["prev_vol_lots"].fillna(np.inf))
     return df[c1 & c2 & c8].reset_index(drop=True)
 
 
@@ -382,7 +461,7 @@ def to_weekly(daily: pd.DataFrame) -> pd.DataFrame:
     return w.dropna(subset=["close"])
 
 
-def evaluate_103(daily: pd.DataFrame, p: Screen103Params) -> dict:
+def evaluate_103(daily: pd.DataFrame, p: Screen103Params, check_vol_up: bool = False) -> dict:
     """
     對單一股票日線（欄位 open/high/low/close/volume[股]，DatetimeIndex，最後一列 = 選股日）
     計算條件 3–7 所需指標與判斷結果。
@@ -411,8 +490,13 @@ def evaluate_103(daily: pd.DataFrame, p: Screen103Params) -> dict:
     out["c5_week_k_up"] = (not p.require_wk_up) or bool(out["week_k"] > out["week_k_prev"])
     out["c6_ma20_lt_ma60"] = (not p.require_ma20_lt_ma60) or bool(ma20 < ma60)
     out["c7_dk_gt_dd"] = (not p.require_dk_gt_dd) or bool(out["day_k"] > out["day_d"])
-    out["match"] = all(out[c] for c in ("c3_ma60_dev", "c4_week_k", "c5_week_k_up",
-                                         "c6_ma20_lt_ma60", "c7_dk_gt_dd"))
+    vol = d["volume"]
+    out["hist_vol_ratio"] = vol.iloc[-1] / vol.iloc[-2] if vol.iloc[-2] > 0 else np.inf
+    out["c8_vol_up"] = bool(out["hist_vol_ratio"] > p.vol_ratio)
+    keys = ["c3_ma60_dev", "c4_week_k", "c5_week_k_up", "c6_ma20_lt_ma60", "c7_dk_gt_dd"]
+    if check_vol_up:
+        keys.append("c8_vol_up")
+    out["match"] = all(out[c] for c in keys)
     return out
 
 
@@ -454,7 +538,10 @@ def fine_screen(cands: pd.DataFrame, trade_date: date, p: Screen103Params,
     def work(row):
         hist = fetch_daily_history(row["code"], trade_date, p.history_days)
         hist = _align_to_trade_date(hist, row, trade_date)
-        return evaluate_103(hist, p)
+        out = evaluate_103(hist, p, check_vol_up=bool(row.get("c8_deferred", False)))
+        if row.get("c8_deferred", False):                # 用日線補上前一日量，供表格顯示
+            out["prev_vol_lots"] = hist["volume"].iloc[-2] / 1000
+        return out
 
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futs = {ex.submit(work, r): r for _, r in cands.iterrows()}
@@ -480,6 +567,9 @@ def screen_103(trade_date=None, params: Screen103Params | None = None, source: s
                progress_cb: Callable[[int, int, str], None] | None = None) -> ScreenResult:
     p = params or Screen103Params()
     mkt, d0, d1, src = load_two_days(trade_date, source)
+    notes = list(mkt.attrs.get("notes", []))
+    for n in notes:
+        print(f"[103] 注意：{n}")
     cands = coarse_screen(mkt, p)
     n_mkt = mkt["market"].value_counts().to_dict()
     n_cand = cands["market"].value_counts().to_dict() if len(cands) else {}
@@ -513,7 +603,7 @@ def screen_103(trade_date=None, params: Screen103Params | None = None, source: s
             "週K": hit["week_k"].round(2),
         }).reset_index(drop=True)
     print(f"[103] 符合全部條件：{len(matches)} 檔")
-    return ScreenResult(matches, detail, d0, d1, src, len(mkt), errors)
+    return ScreenResult(matches, detail, d0, d1, src, len(mkt), errors, notes)
 
 
 def scrape_local_103(params: Screen103Params | None = None, **kw) -> pd.DataFrame:
@@ -529,6 +619,52 @@ def scrape_local_103(params: Screen103Params | None = None, **kw) -> pd.DataFram
     return res.matches
 
 
+def diagnose(codes: list[str], trade_date=None, params: Screen103Params | None = None,
+             source: str = "auto") -> None:
+    """印出指定股票在每個條件的數值與是否通過，用來找出和 Goodinfo 不一致的原因。"""
+    p = params or Screen103Params()
+    mkt, d0, d1, src = load_two_days(trade_date, source)
+    print(f"選股日 {d0}，前一交易日 {d1}，來源 {src}")
+    print("市場檔數：", mkt["market"].value_counts().to_dict())
+    for n in mkt.attrs.get("notes", []):
+        print("注意：", n)
+    for code in codes:
+        print(f"\n===== {code} =====")
+        row = mkt[mkt["code"] == code]
+        if row.empty:
+            print("  ✗ 不在全市場資料中（可能是解析失敗或兩天資料 merge 不到）")
+            continue
+        r = row.iloc[0]
+        print(f"  {r['name']}（{r['market']}） 開 {r['open']} 高 {r['high']} 低 {r['low']} 收 {r['close']}"
+              f" 漲跌 {r['change']}  昨收 {r['prev_close']}")
+        deferred = pd.isna(r["prev_volume"])
+        prev_txt = "（官方前一日缺，改用日線）" if deferred else f"{r['prev_volume']/1000:,.0f} 張"
+        print(f"  量：今 {r['volume']/1000:,.0f} 張  昨 {prev_txt}")
+        rk = red_k_pct(r["open"], r["close"], r["prev_close"], p.red_k_base)
+        checks = {
+            "1 紅K棒幅": (rk, p.red_k_min <= rk <= p.red_k_max),
+            "2 成交張數": (r["volume"] / 1000, p.vol_min <= r["volume"] / 1000 <= p.vol_max),
+        }
+        if not deferred:
+            checks["8 量增"] = (r["volume"] / max(r["prev_volume"], 1),
+                               r["volume"] > p.vol_ratio * r["prev_volume"])
+        for k, (v, ok) in checks.items():
+            print(f"  {'✓' if ok else '✗'} {k}: {v:.2f}")
+        try:
+            hist = _align_to_trade_date(fetch_daily_history(code, d0, p.history_days), r, d0)
+            ev = evaluate_103(hist, p)
+            print(f"  日線 {len(hist)} 根，最後一根 {hist.index[-1].date()}")
+            for k, label, val in [("c3_ma60_dev", "3 季線乖離", ev["ma60_dev"]),
+                                  ("c4_week_k", "4 週K", ev["week_k"]),
+                                  ("c5_week_k_up", "5 週K向上", ev["week_k"] - ev["week_k_prev"]),
+                                  ("c6_ma20_lt_ma60", "6 MA20<MA60", ev["ma20"] - ev["ma60"]),
+                                  ("c7_dk_gt_dd", "7 日K>日D", ev["day_k"] - ev["day_d"]),
+                                  ("c8_vol_up", "8 量增(日線)", ev["hist_vol_ratio"])]:
+                print(f"  {'✓' if ev[k] else '✗'} {label}: {val:.2f}")
+        except Exception as e:                          # noqa: BLE001
+            print(f"  ✗ 細篩失敗：{e}")
+
+
 def _main():
     ap = argparse.ArgumentParser(description="本機計算 Goodinfo「我的選股103」")
     ap.add_argument("--date", help="選股日 YYYY-MM-DD（預設今天，遇休市自動往前）")
@@ -538,7 +674,13 @@ def _main():
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--detail", help="輸出所有候選股的指標與逐條件判斷 CSV")
     ap.add_argument("--csv", help="輸出符合結果 CSV")
+    ap.add_argument("--diag", help="逐條件診斷指定代碼，例如 --diag 5328,8086")
     a = ap.parse_args()
+
+    if a.diag:
+        diagnose([c.strip() for c in a.diag.split(",") if c.strip()], a.date,
+                 Screen103Params(red_k_base=a.base), a.source)
+        return
 
     p = Screen103Params(red_k_base=a.base)
     res = screen_103(a.date, p, a.source, a.workers)

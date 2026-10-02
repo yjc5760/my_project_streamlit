@@ -107,6 +107,8 @@ def match_103(d, w):          # d: 日線, w: 週線（皆含 k, d 欄）
 - [x] 問題 1：所有快取函式失敗時改為 raise，失敗結果（含個股分析 429）不進快取
 - [x] 問題 5：`gitignore.txt` → `.gitignore`，`__pycache__/` 已 `git rm --cached`（已 stage，未 commit）
 - [x] `stock_analyzer` 的 KD 改為台灣遞迴式，與 Goodinfo 一致（所有策略表格與圖表的 K/D 數值會改變）
-- [ ] 尚未用真實網路驗證（開發環境連不到 TWSE/TPEx/FinMind）
+- [x] 2026-10-02 實測與 Goodinfo 選股103 完全一致：2327 國巨、4989 榮科、5328 華容、8086 宏捷科（全市場 1974 檔 → 粗篩 50 → 4）
+- [x] TPEx 實測：新版 `dailyQ` 為 404；舊版 `stk_quote_result.php` 忽略日期、只給最新交易日 → 上櫃前一日量改用 FinMind 日線判斷（條件 8）
+- [ ] 已知限制：查歷史日期時 TPEx 拿不到當日行情，上櫃部分會報錯；做歷史比對腳本前需找可查歷史的 TPEx 端點，或上櫃改全用 FinMind
 - [ ] 與 Goodinfo 歷史結果比對：紅K棒幅分母、週 KD 是否含未收完的本週
 - [ ] 問題 2、3、4、6、7、8

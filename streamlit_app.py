@@ -170,6 +170,7 @@ def _cached_screen_103(params: dict) -> dict:
         'universe_size': res.universe_size,
         'n_candidates': n_cand,
         'errors': res.errors,
+        'notes': res.notes,
     }
 
 @st.cache_data(ttl=market_ttl(1800, 86400))  # 盤中30分鐘；盤後1日
@@ -680,6 +681,8 @@ def display_my_103_results():
         f"資料日期：**{res['trade_date']:%Y/%m/%d}**（前一交易日 {res['prev_date']:%Y/%m/%d}）　"
         f"來源：{src_label}　全市場 {res['universe_size']} 檔 → 粗篩 {res['n_candidates']} 檔"
     )
+    for note in res.get('notes', []):
+        st.info(f"ℹ️ {note}")
     if res['errors']:
         with st.expander(f"⚠️ {len(res['errors'])} 檔候選股抓不到日線，未納入判斷"):
             st.write(res['errors'])
