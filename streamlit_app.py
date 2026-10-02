@@ -17,7 +17,7 @@ from plotly.subplots import make_subplots
 
 try:
     from local_screener import screen_103, Screen103Params, ScreenerError
-    from monthly_revenue_scraper import scrape_goodinfo as scrape_monthly_revenue
+    from revenue_screener import screen_revenue, RevenueParams
     from yahoo_scraper import scrape_yahoo_stock_rankings
     from stock_analyzer import analyze_stock
     from stock_information_plot import plot_stock_revenue_trend, plot_stock_major_shareholders, get_stock_code
@@ -39,9 +39,7 @@ try:
         os.environ['FINMIND_API_TOKEN'] = st.secrets['FINMIND_API_TOKEN']
     else:
         st.warning("在 Streamlit secrets 中找不到 FinMind API token。部分圖表可能無法生成。")
-    # 將 Goodinfo 月營收 Cookie 從 secrets 注入環境變數（我的選股103 已改為本機計算，不需 Cookie）
-    if 'GOODINFO_COOKIE_MONTHLY' in st.secrets:
-        os.environ['GOODINFO_COOKIE_MONTHLY'] = st.secrets['GOODINFO_COOKIE_MONTHLY']
+    # 我的選股103、月營收選股皆已改為本機計算，不再需要 Goodinfo Cookie
 except Exception:
     # 本機執行且無 secrets.toml 時，嘗試從環境變數取得
     if not os.getenv('FINMIND_API_TOKEN'):
@@ -173,9 +171,23 @@ def _cached_screen_103(params: dict) -> dict:
         'notes': res.notes,
     }
 
-@st.cache_data(ttl=market_ttl(1800, 86400))  # 盤中30分鐘；盤後1日
-def _cached_scrape_monthly_revenue():
-    return _require(scrape_monthly_revenue(), "Goodinfo 月營收")
+@st.cache_data(ttl=market_ttl(1800, 21600), show_spinner=False)  # 盤中30分鐘；盤後6小時
+def _cached_screen_revenue(params: dict) -> dict:
+    """月營收選股（本機計算）。ScreenerError 直接往外拋，不會被快取。"""
+    res = screen_revenue(params=RevenueParams(**params))
+    n_cand = len(res.detail) + len(res.errors)
+    if n_cand and len(res.errors) * 2 > n_cand:
+        raise ScreenerError(
+            f"同期排名有 {len(res.errors)}/{n_cand} 檔抓不到 FinMind 月營收，可能是限流，請稍後再試"
+        )
+    return {
+        'matches': res.matches,
+        'months_loaded': res.months_loaded,
+        'universe_size': res.universe_size,
+        'n_candidates': n_cand,
+        'errors': res.errors,
+        'notes': res.notes,
+    }
 
 @st.cache_data(ttl=market_ttl(300, 3600))   # 盤中5分鐘；盤後1小時
 def _cached_fetch_concentration_data():
@@ -199,12 +211,6 @@ def _cached_analyze_stock(stock_id: str) -> dict:
         result['chart_json'] = _fig_to_cache(result.pop('chart_figure'))
     return result
 
-
-def cached_scrape_monthly_revenue():
-    try:
-        return _cached_scrape_monthly_revenue()
-    except _FetchFailed:
-        return None
 
 def cached_fetch_concentration_data():
     try:
@@ -958,12 +964,27 @@ def display_monthly_revenue_visualization(df: pd.DataFrame):
 
 
 def display_monthly_revenue_results():
-    st.header("📈 月營收強勢股 (from Goodinfo)")
-    with st.spinner("正在從 Goodinfo! 網站爬取月營收資料..."):
-        scraped_df = cached_scrape_monthly_revenue()
+    st.header("📈 月營收強勢股（本機計算）")
+    params = st.session_state.get('params_rev', asdict(RevenueParams()))
+    try:
+        with st.spinner("正在讀取公開資訊觀測站月營收並計算條件（首次約需 1 分鐘）..."):
+            res = _cached_screen_revenue(params)
+    except ScreenerError as e:
+        st.error(f"❌ 月營收選股失敗：{e}")
+        st.caption("失敗結果不會被快取，稍後重新按一次按鈕即可重試。")
+        return
 
-    if scraped_df is not None and not scraped_df.empty:
-        st.success(f"成功爬取到 {len(scraped_df)} 筆資料，正在進行技術指標分析...")
+    months_txt = "、".join(f"{y}/{m:02d}（{n}家）" for y, m, n in res['months_loaded'] if n)
+    st.caption(f"營收資料：{months_txt}　全市場 {res['universe_size']} 家 → 年增率條件 {res['n_candidates']} 家")
+    for note in res.get('notes', []):
+        st.info(f"ℹ️ {note}")
+    if res['errors']:
+        with st.expander(f"⚠️ {len(res['errors'])} 檔抓不到 FinMind 月營收，未納入同期排名判斷"):
+            st.write(res['errors'])
+
+    scraped_df = res['matches'].copy()
+    if not scraped_df.empty:
+        st.success(f"共 {len(scraped_df)} 檔符合條件，正在進行技術指標分析...")
 
         # 並發分析（以 ThreadPoolExecutor 取代逐筆順序呼叫）
         raw_codes = [str(r.代碼).strip() for r in scraped_df.itertuples()]
@@ -991,15 +1012,12 @@ def display_monthly_revenue_results():
         scraped_df['KD'] = [f"K:{k} D:{d}" for k, d in zip(k_values, d_values)]
         scraped_df['I值'] = i_values
 
-        st.info("""
-        **篩選條件 (來自 Goodinfo 月營收自訂篩選):**
-        1.  單月營收年增率(%) - 當月 > 15%
-        2.  單月營收年增率(%) - 前1月 > 10%
-        3.  單月營收年增率(%) - 前2月 > 10%
-        4.  單月營收年增率(%) - 前3月 > 10%
-        5.  單月營收年增率(%) - 前4月 > 10%
-        6.  單月營收創歷年同期前3高
-        """)
+        st.info(f"""
+**篩選條件（本機計算，等同 Goodinfo 月營收選股03）：**
+1.  單月營收年增率 – 當月 ≥ {params['yoy_cur_min']}%（當月 = {'各公司最新公告月份' if params.get('per_company_month') else '全市場最新公告月份'}）
+2.  單月營收年增率 – 前1～{params['n_prev']}月皆 ≥ {params['yoy_prev_min']}%
+3.  單月營收創歷年同期前 {params['top_n']} 高
+""")
 
         all_cols = scraped_df.columns.tolist()
         try:
@@ -1024,11 +1042,12 @@ def display_monthly_revenue_results():
             with st.expander(f"查看 {stock_name} ({stock_code}) 的技術分析圖"):
                 analysis_result = revenue_cache.get(stock_code) or cached_analyze_stock(stock_code)
                 if analysis_result['status'] == 'success':
-                    st.plotly_chart(_fig_from_cache(analysis_result['chart_json']), use_container_width=True)
+                    st.plotly_chart(_fig_from_cache(analysis_result['chart_json']), use_container_width=True,
+                                    key=f"chartrev_{stock_code}")
                 else:
                     show_analysis_error(stock_name, analysis_result)
     else:
-        st.warning("未爬取到任何月營收資料。請檢查 Cookie 是否有效。")
+        st.warning("目前沒有符合全部條件的股票。")
 
 
 def display_ranking_visualization(summary_df: pd.DataFrame):
@@ -1407,13 +1426,7 @@ def main():
 
     # ── 改善 1：側邊欄連線狀態燈號 ──────────────────────────────────────
     st.sidebar.header("🔌 連線狀態")
-    _gi_monthly = os.getenv('GOODINFO_COOKIE_MONTHLY', '')
     _finmind    = os.getenv('FINMIND_API_TOKEN', '')
-
-    if _gi_monthly:
-        st.sidebar.success("✅ Goodinfo 月營收 Cookie 已設定")
-    else:
-        st.sidebar.error("⛔ Goodinfo 月營收 Cookie 未設定（GOODINFO_COOKIE_MONTHLY）")
 
     if _finmind:
         st.sidebar.success("✅ FinMind API Token 已設定")
@@ -1443,6 +1456,18 @@ def main():
         p103_dev = st.slider("季線乖離（%）", -15.0, 15.0, (_d.ma60_dev_min, _d.ma60_dev_max), step=0.5, key="p103_dev")
         p103_wk = st.slider("週K值上限", 10, 100, int(_d.wk_max), step=5, key="p103_wk")
         p103_vr = st.slider("量增倍數（今 / 昨）", 1.0, 3.0, _d.vol_ratio, step=0.1, key="p103_vr")
+    with st.sidebar.expander("月營收選股條件", expanded=False):
+        _r = RevenueParams()
+        prev_cur = st.slider("當月年增率下限（%）", 0, 50, int(_r.yoy_cur_min), step=5, key="prev_cur")
+        prev_min = st.slider("前幾月年增率下限（%）", 0, 50, int(_r.yoy_prev_min), step=5, key="prev_min")
+        prev_n = st.slider("連續檢查前幾個月", 1, 5, _r.n_prev, key="prev_n")
+        prev_top = st.slider("創歷年同期前 N 高（0 = 不檢查）", 0, 5, _r.top_n, key="prev_top")
+        prev_pc = st.checkbox("各公司以自己最新公告月份為當月", value=False, key="prev_pc",
+                              help="不勾選＝與 Goodinfo 相同，全市場統一以最新有公告的月份為當月")
+    st.session_state['params_rev'] = asdict(RevenueParams(
+        yoy_cur_min=float(prev_cur), yoy_prev_min=float(prev_min), n_prev=prev_n, top_n=prev_top,
+        months_to_load=max(6, prev_n + 2), per_company_month=prev_pc,
+    ))
     st.session_state['params_103'] = asdict(Screen103Params(
         red_k_min=p103_red[0], red_k_max=p103_red[1], red_k_base=p103_base,
         vol_min=float(p103_vol), ma60_dev_min=p103_dev[0], ma60_dev_max=p103_dev[1],
@@ -1463,7 +1488,7 @@ def main():
         st.session_state.action = "concentration_pick"
     if st.sidebar.button("我的選股103（本機計算）"):
         st.session_state.action = "my_stock_picks"
-    if st.sidebar.button("月營收選股 (Goodinfo)"):
+    if st.sidebar.button("月營收選股（本機計算）"):
         st.session_state.action = "monthly_revenue_pick"
 
     st.sidebar.header("盤中即時排行")
