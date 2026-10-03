@@ -67,14 +67,19 @@
 | 模組 | 功能 |
 |---|---|
 | `streamlit_app.py` | 主程式：UI、快取、上次成功結果 |
-| `local_screener.py` | 我的選股103（粗篩＋細篩），可獨立執行 |
+| `services.py` | 選股流程共用邏輯（篩選規則、批次分析、上次成功結果）；Streamlit 與 MCP 共用 |
+| `mcp_server.py` | MCP Server：把選股與個股分析開放給 Antigravity 等 AI 工具 |
+| `local_screener.py` | 我的選股103（粗篩＋細篩），可獨立執行；細篩日線會保留給後續算指標、畫圖 |
 | `revenue_screener.py` | 月營收選股，可獨立執行 |
 | `indicators.py` | 共用技術指標（台灣遞迴 KD） |
-| `stock_analyzer.py` | 個股技術指標計算與圖表（FinMind 日線） |
+| `stock_analyzer.py` | 個股技術指標與圖表；指標與畫圖分開（批次只算指標） |
+| `finmind_client.py` | FinMind 共用連線：共用 Session、額度用完立即停止、錯誤分類 |
+| `market_calendar.py` | 台股交易日曆（證交所休市日）與盤中判斷 |
 | `stock_information_plot.py` | 月營收趨勢圖、大戶持股變化圖 |
 | `concentration_1day.py` | 籌碼集中度爬蟲與篩選 |
-| `yahoo_scraper.py` | Yahoo 漲幅排行爬蟲（含備援解析）與盤中預估量因子 |
+| `yahoo_scraper.py` | Yahoo 漲幅排行爬蟲（含備援解析）與盤中預估量因子（非交易日為 1） |
 | `scrape_utils.py` | 爬蟲錯誤分類、上次成功結果存取 |
+| `tests/` | pytest 單元測試（不連網）：`pip install -r requirements-dev.txt` 後執行 `pytest` |
 
 ---
 
@@ -116,6 +121,33 @@ python revenue_screener.py --diag 2402,6712       # 逐條件診斷＋歷年同�
 ```
 
 ---
+
+## MCP Server（給 Antigravity 等 AI 工具呼叫）
+
+`mcp_server.py` 把側邊欄的 6 個功能開放成 MCP 工具，在本機以 stdio 執行。Streamlit Cloud 只執行 `streamlit_app.py`、只安裝 `requirements.txt`，不受影響。
+
+| 工具 | 對應功能 |
+|---|---|
+| `concentration_pick` | 1日籌碼集中度選股（可附日 KD／I 值） |
+| `my_stock_103` | 我的選股103（本機計算），8 個條件皆可傳參數 |
+| `monthly_revenue_pick` | 月營收選股（本機計算） |
+| `gain_ranking` | 漲幅排行榜，`market` = 上市／上櫃 |
+| `stock_analysis` | 個股分析：K、D、I 值，三張圖另存成 `mcp_output/*.html` |
+
+安裝（Windows，獨立虛擬環境，不影響原本的環境）：
+
+```cmd
+cd C:\Users\yjc57\Downloads\my_project_streamlit
+python -m venv .venv-mcp
+.venv-mcp\Scripts\pip install -r requirements-mcp.txt
+```
+
+接著把 `mcp_config.example.json` 的內容合併進 Antigravity 的全域設定 `~/.gemini/config/mcp_config.json`，然後在 Antigravity 的 MCP 管理面板重新載入。
+FinMind token 會自動讀取 `.streamlit/secrets.toml`；也可以在設定檔的 `env` 加入 `FINMIND_API_TOKEN`。
+
+注意：
+- 不要把 `mcp` 加進 `requirements.txt`。
+- 共用模組裡的 `print()` 已在 `mcp_server.py` 導向 stderr，不會干擾 MCP 協定。
 
 ## 資料來源
 

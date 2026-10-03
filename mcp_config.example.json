@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "tw-stock-analyzer": {
+      "command": "C:\\Users\\yjc57\\Downloads\\my_project_streamlit\\.venv-mcp\\Scripts\\python.exe",
+      "args": ["C:\\Users\\yjc57\\Downloads\\my_project_streamlit\\mcp_server.py"],
+      "cwd": "C:\\Users\\yjc57\\Downloads\\my_project_streamlit",
+      "env": {
+        "PYTHONIOENCODING": "utf-8"
+      }
+    }
+  }
+}

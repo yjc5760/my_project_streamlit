@@ -14,3 +14,9 @@ venv/
 
 # 上次成功結果（last-known-good）
 .cache/
+
+# MCP Server 本機輸出與 Antigravity 工作區設定（含本機路徑／token，不進版控）
+mcp_output/
+.agents/mcp_config.json
+.venv-mcp/
+.pytest_cache/

@@ -28,7 +28,6 @@ tw_kd 放在 indicators.py，stock_analyzer 的個股 KD 也改用同一個算�
 from __future__ import annotations
 
 import argparse
-import os
 import re
 import sys
 import time
@@ -41,6 +40,7 @@ import numpy as np
 import pandas as pd
 import requests
 
+import finmind_client
 from indicators import tw_kd  # noqa: F401  （台灣遞迴 KD，與 stock_analyzer 共用）
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -48,7 +48,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36")
-FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
+FINMIND_URL = finmind_client.API_URL
 
 # 與 scrape_goodinfo() 相同的輸出欄位，streamlit_app 可直接沿用
 OUTPUT_COLUMNS = ["代碼", "名稱", "市場", "股價日期", "成交", "漲跌價", "漲跌幅", "成交張數"]
@@ -90,6 +90,7 @@ class ScreenResult:
     universe_size: int               # 粗篩前的股票數
     errors: dict = field(default_factory=dict)   # 細篩抓資料失敗的代碼 → 訊息
     notes: list = field(default_factory=list)    # 資料來源降級等提示
+    histories: dict = field(default_factory=dict)  # 符合者的日線（代碼 → DataFrame），免重抓 FinMind
 
 
 # ---------------------------------------------------------------------------
@@ -151,29 +152,13 @@ def _get_json(url: str, params: dict | None = None, timeout: int = 20, retries: 
 
 
 def _finmind(params: dict) -> pd.DataFrame:
-    token = os.getenv("FINMIND_API_TOKEN")
-    headers = {"User-Agent": UA}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    last = None
-    for i in range(3):
-        try:
-            r = requests.get(FINMIND_URL, params=params, headers=headers, timeout=30)
-            if r.status_code == 429 and i < 2:
-                time.sleep(2 ** (i + 1))
-                continue
-            r.raise_for_status()
-            js = r.json()
-            if js.get("status") != 200:
-                raise ScreenerError(f"FinMind 錯誤: {js.get('msg') or js.get('error_message') or js}")
-            return pd.DataFrame(js.get("data") or [])
-        except ScreenerError:
-            raise
-        except (requests.RequestException, ValueError) as e:
-            last = e
-            if i < 2:
-                time.sleep(1 + i)
-    raise ScreenerError(f"FinMind 連線失敗: {last}")
+    """FinMind 查詢一律走 finmind_client（共用連線、額度保護）；錯誤轉成 ScreenerError。"""
+    p = dict(params)
+    try:
+        return finmind_client.fetch(p.pop("dataset"), p.pop("data_id", None),
+                                    p.pop("start_date", None), p.pop("end_date", None))
+    except finmind_client.FinMindError as e:
+        raise ScreenerError(str(e)) from e
 
 
 # ---------------------------------------------------------------------------
@@ -504,17 +489,10 @@ def evaluate_103(daily: pd.DataFrame, p: Screen103Params, check_vol_up: bool = F
 # 細篩：逐檔抓 FinMind 日線
 # ---------------------------------------------------------------------------
 def fetch_daily_history(code: str, end: date, days: int) -> pd.DataFrame:
-    df = _finmind({"dataset": "TaiwanStockPrice", "data_id": code,
-                   "start_date": (end - timedelta(days=days)).isoformat(),
-                   "end_date": end.isoformat()})
-    if df.empty:
-        raise ScreenerError(f"FinMind 無 {code} 日線")
-    df = df.rename(columns={"max": "high", "min": "low", "Trading_Volume": "volume"})
-    df["date"] = pd.to_datetime(df["date"])
-    df = df.set_index("date")[["open", "high", "low", "close", "volume"]].apply(
-        pd.to_numeric, errors="coerce")
-    # FinMind 暫停交易日會給 0 價，剔除
-    return df[(df["close"] > 0) & (df["high"] > 0)].dropna()
+    try:
+        return finmind_client.price_history(code, end - timedelta(days=days), end)
+    except finmind_client.FinMindError as e:
+        raise ScreenerError(str(e)) from e
 
 
 def _align_to_trade_date(hist: pd.DataFrame, row: pd.Series, trade_date: date) -> pd.DataFrame:
@@ -530,8 +508,10 @@ def _align_to_trade_date(hist: pd.DataFrame, row: pd.Series, trade_date: date) -
 
 def fine_screen(cands: pd.DataFrame, trade_date: date, p: Screen103Params,
                 max_workers: int = 4,
-                progress_cb: Callable[[int, int, str], None] | None = None
+                progress_cb: Callable[[int, int, str], None] | None = None,
+                histories: dict | None = None,
                 ) -> tuple[pd.DataFrame, dict]:
+    """histories 傳入 dict 時，會把符合全部條件者的日線存進去（供後續算指標、畫圖，免重抓）。"""
     rows, errors = [], {}
     total = len(cands)
 
@@ -541,6 +521,8 @@ def fine_screen(cands: pd.DataFrame, trade_date: date, p: Screen103Params,
         out = evaluate_103(hist, p, check_vol_up=bool(row.get("c8_deferred", False)))
         if row.get("c8_deferred", False):                # 用日線補上前一日量，供表格顯示
             out["prev_vol_lots"] = hist["volume"].iloc[-2] / 1000
+        if histories is not None and out["match"]:
+            histories[row["code"]] = hist
         return out
 
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
@@ -579,7 +561,9 @@ def screen_103(trade_date=None, params: Screen103Params | None = None, source: s
     if not n_mkt.get("上櫃"):
         raise ScreenerError("全市場資料中沒有上櫃股票，TPEx 來源可能失效")
 
-    detail, errors = fine_screen(cands, d0, p, max_workers, progress_cb) if len(cands) else (pd.DataFrame(), {})
+    histories: dict = {}
+    detail, errors = (fine_screen(cands, d0, p, max_workers, progress_cb, histories)
+                      if len(cands) else (pd.DataFrame(), {}))
     if errors:
         print(f"[103] 細篩失敗 {len(errors)} 檔：{list(errors)[:10]}")
 
@@ -606,7 +590,7 @@ def screen_103(trade_date=None, params: Screen103Params | None = None, source: s
             "量比": (hit["vol_lots"] / hit["prev_vol_lots"]).round(2),
         }).reset_index(drop=True)
     print(f"[103] 符合全部條件：{len(matches)} 檔")
-    return ScreenResult(matches, detail, d0, d1, src, len(mkt), errors, notes)
+    return ScreenResult(matches, detail, d0, d1, src, len(mkt), errors, notes, histories)
 
 
 def scrape_local_103(params: Screen103Params | None = None, **kw) -> pd.DataFrame:

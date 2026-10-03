@@ -1,9 +1,10 @@
 import pandas as pd
 import numpy as np
-import os
 import datetime
 import requests
 import twstock
+
+import finmind_client
 from bs4 import BeautifulSoup
 from io import StringIO
 
@@ -141,21 +142,9 @@ def plot_stock_revenue_trend(stock_identifier):
         return None, f"錯誤: 在 twstock 資料庫中找不到股票 '{stock_identifier}'"
 
     try:
-        # 獲取資料 (與原版相同)
-        finmind_api_token = os.getenv('FINMIND_API_TOKEN')
-        finmind_url = "https://api.finmindtrade.com/api/v4/data"
-        start_date = f"{datetime.date.today().year - 3}-01-01"
-        end_date = datetime.date.today().strftime('%Y-%m-%d')
-        params = {"dataset": "TaiwanStockMonthRevenue", "data_id": stock_code, "start_date": start_date, "end_date": end_date}
-        headers = {"Authorization": f"Bearer {finmind_api_token}"} if finmind_api_token else {}
-        response = requests.get(finmind_url, params=params, headers=headers, timeout=20)
-        response.raise_for_status()
-        raw_data = response.json()
-        if raw_data.get("status") != 200:
-             raise ValueError(f"FinMind API 錯誤: {raw_data.get('msg', '未知錯誤')}")
-        revenue_df = pd.DataFrame(raw_data.get('data'))
-        if revenue_df.empty:
-            raise ValueError("FinMind API 未回傳營收資料。")
+        # 經由 finmind_client 取得（共用連線、額度保護）
+        today = datetime.date.today()
+        revenue_df = finmind_client.month_revenue(stock_code, datetime.date(today.year - 3, 1, 1), today)
 
         # 數據處理 (與原版相同)
         revenue_df['date'] = pd.to_datetime(revenue_df['date'])
@@ -195,9 +184,7 @@ def plot_stock_revenue_trend(stock_identifier):
 
         return fig, None
 
-    except requests.exceptions.RequestException as e:
-        return None, f"錯誤: 連線 FinMind API 時發生錯誤: {e}"
-    except ValueError as e:
-        return None, f"錯誤: 處理 FinMind API 資料時發生錯誤: {e}"
+    except finmind_client.FinMindError as e:
+        return None, f"錯誤: {e}"
     except Exception as e:
-        return None, f"錯誤: 獲取營收資料時發生未預期錯誤: {e}"
+        return None, f"錯誤: 處理營收資料時發生未預期錯誤: {e}"

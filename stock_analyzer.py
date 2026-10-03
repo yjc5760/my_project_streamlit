@@ -1,128 +1,95 @@
-import os
-import time
-import pandas as pd
-import numpy as np
-import requests
-import twstock
+# stock_analyzer.py
+"""
+個股技術分析：日線 → 指標（KD、乖離、I/J/K 訊號、MACD、WMA）→ 7 層 Plotly 圖。
+
+- 指標與畫圖分開：批次選股只需要 K、D、I 值時用 analyze_stock(..., with_chart=False)，
+  不建圖、不佔記憶體；要看圖時再用同一份日線呼叫 build_chart()。
+- 可傳入已抓好的日線（price_data），例如 103 細篩抓過的日線，避免重複呼叫 FinMind。
+- 失敗時 analyze_stock 回傳 {'status': 'error', 'error_type': ..., 'message': ...}，
+  error_type 由例外類別決定（不再比對錯誤訊息文字）：
+  rate_limit / network / no_data / insufficient_data / api / unknown
+"""
+from __future__ import annotations
+
 from datetime import date, timedelta
 
+import numpy as np
+import pandas as pd
+import twstock
+
+import finmind_client
 from indicators import tw_kd
+from market_calendar import now_tw
 from viz import (I_STYLES, NEUTRAL_COLOR, REF_LINE, SERIES, DOWN_COLOR, UP_COLOR)
 
-# --- 新增 Plotly 相關導入 ---
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+MIN_BARS = 60          # 季線（60 日）需要的最少日線數
 
 
-def _get_with_retry(
-    url: str,
-    params: dict,
-    headers: dict,
-    timeout: int = 20,
-    max_retries: int = 3
-) -> requests.Response:
-    """帶指數退避的 GET 請求；HTTP 429 Rate Limit 時自動重試。"""
-    last_exc: Exception | None = None
-    for attempt in range(max_retries):
-        try:
-            resp = requests.get(url, params=params, headers=headers, timeout=timeout)
-            if resp.status_code == 429 and attempt < max_retries - 1:
-                wait = 2 ** attempt
-                print(f"⚠️  FinMind Rate Limit (429)，{wait}s 後重試 ({attempt+1}/{max_retries})...")
-                time.sleep(wait)
-                continue
-            resp.raise_for_status()
-            return resp
-        except requests.exceptions.RequestException as exc:
-            last_exc = exc
-            if attempt < max_retries - 1:
-                time.sleep(1)
-    raise requests.exceptions.RequestException(
-        f"連線失敗，已重試 {max_retries} 次: {last_exc}"
-    )
+class AnalysisError(RuntimeError):
+    """個股分析失敗；kind 對應 analyze_stock 回傳的 error_type。"""
+    def __init__(self, kind: str, message: str):
+        self.kind = kind
+        super().__init__(message)
+
+
+def fetch_price_history(stock_id: str, days: int = 300) -> pd.DataFrame:
+    """抓近 days 天日線（欄位 open/high/low/close/volume，volume 單位：股）。"""
+    today = now_tw().date()
+    try:
+        return finmind_client.price_history(stock_id, today - timedelta(days=days), today)
+    except finmind_client.FinMindError as e:
+        raise AnalysisError(e.kind, str(e)) from e
+
+
+def _to_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
+    """接受 open/high/... 或 Open/High/... 欄位，統一成 Open/High/Low/Close/Volume。"""
+    cols = {c: c.capitalize() for c in df.columns if c.lower() in ("open", "high", "low", "close", "volume")}
+    out = df.rename(columns=cols)[["Open", "High", "Low", "Close", "Volume"]].copy()
+    out.index = pd.to_datetime(out.index)
+    return out.sort_index().dropna(subset=["Close"])
+
+
+def avg_volume_before_today(volume: pd.Series, n: int = 5, today: date | None = None) -> float | None:
+    """
+    「前 n 日均量」（單位同輸入）：只取今天以前的 n 根。
+    盤中 FinMind 還沒有今天這根時，最後一根就是昨天，不能再去掉。
+    """
+    today = today or now_tw().date()
+    v = volume.dropna()
+    if len(v) and pd.Timestamp(v.index[-1]).date() >= today:
+        v = v.iloc[:-1]
+    v = v.iloc[-n:]
+    return float(v.mean()) if len(v) else None
+
+
 class TaiwanStockAnalyzer:
-    def __init__(self, stock_id: str, days: int = 300) -> None:
+    def __init__(self, stock_id: str, days: int = 300, price_data: pd.DataFrame | None = None) -> None:
         """
-        初始化股票分析器
         :param stock_id: 股票代碼
-        :param days: 分析期間天數
+        :param days: 分析期間天數（日曆天）
+        :param price_data: 已抓好的日線；給了就不再呼叫 FinMind
         """
         self.stock_id = stock_id
         self.days = days
-        self.start_date = date.today() - timedelta(days=days)
         self.stock_name = self._get_stock_name()
-        self.price_data: pd.DataFrame = pd.DataFrame()
+        self.price_data: pd.DataFrame = _to_ohlcv(price_data) if price_data is not None else pd.DataFrame()
         self.indicators = {}
-        self.finmind_api_token = os.getenv('FINMIND_API_TOKEN')
 
     def _get_stock_name(self) -> str:
-        """利用 twstock 取得股票名稱"""
-        try:
-            info = twstock.codes[self.stock_id]
-            return info.name
-        except KeyError:
-            print(f"警告: 股票代碼 {self.stock_id} 在 twstock.codes 中未找到。將使用代碼作為名稱。")
-            return self.stock_id
+        info = twstock.codes.get(self.stock_id)
+        return info.name if info else self.stock_id
 
     def fetch_data(self) -> None:
-        """從 FinMind API 抓取股票資料 (此函式邏輯不變)"""
-        print(f"正在從 FinMind API 抓取股票 {self.stock_id} 的資料...")
-        
-        finmind_url = "https://api.finmindtrade.com/api/v4/data"
-        params = {
-            "dataset": "TaiwanStockPrice",
-            "data_id": self.stock_id,
-            "start_date": self.start_date.strftime('%Y-%m-%d'),
-            "end_date": date.today().strftime('%Y-%m-%d'),
-        }
-        headers = {}
-        if self.finmind_api_token:
-            headers["Authorization"] = f"Bearer {self.finmind_api_token}"
-            print("使用 FinMind API Token 進行驗證。")
-        else:
-            print("警告: 未設定 FINMIND_API_TOKEN 環境變數，將嘗試匿名存取 FinMind API。")
+        if self.price_data.empty:
+            self.price_data = _to_ohlcv(fetch_price_history(self.stock_id, self.days))
+        if len(self.price_data) < MIN_BARS:
+            raise AnalysisError("insufficient_data",
+                                f"{self.stock_id} 日線只有 {len(self.price_data)} 根，不足 {MIN_BARS} 根")
 
-        try:
-            response = _get_with_retry(finmind_url, params=params, headers=headers, timeout=20)
-            raw_data = response.json()
-            
-            if raw_data.get("status") != 200:
-                error_message_from_api = raw_data.get('error_message', 'FinMind API 回傳錯誤')
-                raise ValueError(f"FinMind API 錯誤: {error_message_from_api}")
-
-            data_list = raw_data.get('data')
-            if not data_list:
-                raise ValueError(f"FinMind API 未回傳股票 {self.stock_id} 的資料。")
-
-            data = pd.DataFrame(data_list)
-            data.rename(columns={
-                'date': 'Date', 'open': 'Open', 'max': 'High',
-                'min': 'Low', 'close': 'Close', 'Trading_Volume': 'Volume'
-            }, inplace=True)
-            
-            data['Date'] = pd.to_datetime(data['Date'])
-            data.set_index('Date', inplace=True)
-            data = data[['Open', 'High', 'Low', 'Close', 'Volume']]
-            
-            for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
-                data[col] = pd.to_numeric(data[col], errors='coerce')
-            
-            self.price_data = data.dropna(subset=['Close'])
-            
-            if self.price_data.empty:
-                raise ValueError("資料處理後為空。")
-            
-            print(f"成功從 FinMind API 抓取並處理 {self.stock_id} 的資料。共 {len(self.price_data)} 筆。")
-
-        except requests.exceptions.RequestException as e:
-            raise ValueError(f"連線 FinMind API 時發生錯誤: {e}")
-        except ValueError as e:
-            raise ValueError(f"處理 FinMind API 資料時發生錯誤: {e}")
-        except Exception as e:
-            raise ValueError(f"抓取 FinMind API 資料時發生未預期錯誤: {type(e).__name__} - {e}")
-    
-    # --- 指標計算函式 (邏輯不變) ---
+    # --- 指標計算函式 ---
     def calculate_weighted_moving_average(self, prices, period):
         weights = np.arange(1, period + 1, dtype=float)
         weight_sum = weights.sum()
@@ -198,7 +165,9 @@ class TaiwanStockAnalyzer:
         # 均線糾結時（三乖離差距皆小於 0.1%）輸出 0（中性），避免盤整期訊號跳動
         FLAT_THRESHOLD = 0.1
         is_flat = (np.abs(a - b) < FLAT_THRESHOLD) & (np.abs(b - c) < FLAT_THRESHOLD)
-        signals = np.where(is_flat, 0, signals)
+        signals = np.where(is_flat, 0, signals).astype(float)
+        # 季線暖機期（任一乖離為 NaN）沒有意義，設為 NaN，不要落到預設的 -3
+        signals[np.isnan(a) | np.isnan(b) | np.isnan(c)] = np.nan
         return signals
 
     def _calculate_deviation_signal(self) -> np.ndarray:
@@ -219,7 +188,8 @@ class TaiwanStockAnalyzer:
         # 動態裁切：去除均線暖機期的 NaN，同時確保至少保留 20 筆資料
         df = df.dropna(subset=['sma60']).copy()
         if df.empty or len(df) < 20:
-            raise ValueError(f"股票 {self.stock_id} 有效資料不足（dropna 後僅剩 {len(df)} 筆），無法繪圖。")
+            raise AnalysisError("insufficient_data",
+                                f"股票 {self.stock_id} 有效資料不足（dropna 後僅剩 {len(df)} 筆），無法繪圖。")
 
         blue, amber, violet = SERIES
         up = df['Close'] >= df['Close'].shift(1).fillna(df['Open'])
@@ -343,58 +313,48 @@ def _last_valid(arr) -> float | None:
     return float(valid[-1]) if len(valid) > 0 else None
 
 
-def analyze_stock(stock_id: str, days: int = 300) -> dict:
+def analyze_stock(stock_id: str, days: int = 300, with_chart: bool = True,
+                  price_data: pd.DataFrame | None = None) -> dict:
     """
-    主函式：分析指定股票並返回包含圖表物件的字典。
+    分析個股。成功：{'status': 'success', 'indicators': {k, d, i_value, avg_vol_5}, 'price_data': 日線,
+    'chart_figure': Figure（with_chart=True 時才有）}。
+    失敗：{'status': 'error', 'error_type': ..., 'message': ...}。
+    avg_vol_5 為「今天以前」的 5 日均量（股）。
     """
     try:
-        analyzer = TaiwanStockAnalyzer(stock_id, days)
-        print(f"正在抓取 {stock_id} ({analyzer.stock_name}) 的資料...")
+        analyzer = TaiwanStockAnalyzer(stock_id, days, price_data)
         analyzer.fetch_data()
-        
-        print("計算技術指標中...")
         analyzer.calculate_indicators()
-        
-        print("計算交易訊號中...")
         analyzer.calculate_signals()
-
-        print(f"產生圖表物件: {stock_id}")
-        chart_figure = analyzer.create_chart()
-
-        # 使用 _last_valid 取最後一個非 NaN 值，避免暖機期 NaN 被誤判為有效數值
-        last_k = _last_valid(analyzer.indicators.get('k', []))
-        last_d = _last_valid(analyzer.indicators.get('d', []))
-        last_i = _last_valid(analyzer.indicators.get('I_value', []))
-        avg_vol_5 = analyzer.price_data['Volume'].iloc[-6:-1].mean()
-
-        return {
+        result = {
             'status': 'success',
-            'chart_figure': chart_figure, # 返回圖表物件，而不是圖片路徑
+            'price_data': analyzer.price_data,
             'indicators': {
-                'k': last_k,
-                'd': last_d,
-                'i_value': last_i,
-                'avg_vol_5': avg_vol_5
-            }
+                # 取最後一個非 NaN 值，避免暖機期 NaN 被誤判為有效數值
+                'k': _last_valid(analyzer.indicators.get('k', [])),
+                'd': _last_valid(analyzer.indicators.get('d', [])),
+                'i_value': _last_valid(analyzer.indicators.get('I_value', [])),
+                'avg_vol_5': avg_volume_before_today(analyzer.price_data['Volume']),
+            },
         }
+        if with_chart:
+            result['chart_figure'] = analyzer.create_chart()
+        return result
+    except AnalysisError as e:
+        error_type, message = e.kind, str(e)
+    except finmind_client.FinMindError as e:
+        error_type, message = e.kind, str(e)
+    except Exception as e:                      # noqa: BLE001
+        error_type, message = 'unknown', f"{type(e).__name__}: {e}"
+    print(f"[analyze_stock] {stock_id} 失敗（{error_type}）：{message}")
+    return {'status': 'error', 'error_type': error_type,
+            'message': f"分析過程發生錯誤 ({stock_id}): {message}"}
 
-    except Exception as e:
-        error_message = f"分析過程發生錯誤 ({stock_id}): {str(e)}"
-        print(error_message)
-        # 改善 5：分類錯誤類型，讓 UI 層可以顯示更具體的提示
-        err_str = str(e).lower()
-        if '429' in err_str or 'rate limit' in err_str or 'too many' in err_str:
-            error_type = 'rate_limit'
-        elif 'timeout' in err_str or 'connection' in err_str or 'network' in err_str:
-            error_type = 'network'
-        elif '未回傳' in str(e) or 'no data' in err_str or '資料處理後為空' in str(e):
-            error_type = 'no_data'
-        elif '有效資料不足' in str(e):
-            error_type = 'insufficient_data'
-        else:
-            error_type = 'unknown'
-        return {
-            'status': 'error',
-            'error_type': error_type,
-            'message': error_message
-        }
+
+def build_chart(stock_id: str, price_data: pd.DataFrame | None = None, days: int = 300) -> go.Figure:
+    """只要圖：用給定日線（或重新抓）建 7 層技術分析圖。失敗時 raise AnalysisError。"""
+    analyzer = TaiwanStockAnalyzer(stock_id, days, price_data)
+    analyzer.fetch_data()
+    analyzer.calculate_indicators()
+    analyzer.calculate_signals()
+    return analyzer.create_chart()

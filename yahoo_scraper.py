@@ -7,6 +7,7 @@ import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+from market_calendar import is_trading_day
 from scrape_utils import ScrapeError, fetch_html
 
 
@@ -76,11 +77,15 @@ _FACTOR_TABLE = pd.read_csv(StringIO(_CSV_DATA), skipinitialspace=True)
 _FACTOR_TABLE['Time'] = pd.to_datetime(_FACTOR_TABLE['Time'], format='%H:%M').dt.time
 
 
-def _get_volume_factor() -> float:
+def _get_volume_factor(now: datetime | None = None) -> float:
     """
     根據當前時間從模組層級的因子表查表並內插計算成交量預估因子。
+    非交易日（週末、國定假日）Yahoo 顯示的是上一個交易日的全天量，因子一律為 1.0。
     """
-    now_time = datetime.now(ZoneInfo("Asia/Taipei")).time()
+    now = now or datetime.now(ZoneInfo("Asia/Taipei"))
+    if not is_trading_day(now.date()):
+        return 1.0
+    now_time = now.time()
 
     nine_am = datetime.strptime("09:00", "%H:%M").time()
     one_thirty_pm = datetime.strptime("13:30", "%H:%M").time()

@@ -5,24 +5,25 @@ import pandas as pd
 import os
 import re
 from dataclasses import asdict
-from datetime import datetime, time as dtime
+from datetime import datetime
 from zoneinfo import ZoneInfo
 import twstock
 import numpy as np
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import plotly.graph_objects as go
 import plotly.express as px
 import plotly.io as pio
 from plotly.subplots import make_subplots
 
 try:
-    from local_screener import screen_103, Screen103Params, ScreenerError
-    from revenue_screener import screen_revenue, RevenueParams
+    from local_screener import Screen103Params, ScreenerError
+    from revenue_screener import RevenueParams
     from yahoo_scraper import scrape_yahoo_stock_rankings
-    from stock_analyzer import analyze_stock
+    from stock_analyzer import analyze_stock, build_chart, fetch_price_history, AnalysisError
+    from market_calendar import is_trading_hours
+    import services
     from stock_information_plot import plot_stock_revenue_trend, plot_stock_major_shareholders, get_stock_code
-    from concentration_1day import fetch_stock_concentration_data, filter_stock_data
-    from scrape_utils import ScrapeError, lkg_key, lkg_load, lkg_save
+    from concentration_1day import fetch_stock_concentration_data
+    from scrape_utils import ScrapeError, lkg_key
     from viz import (UP_COLOR, DOWN_COLOR, SERIES, REF_LINE, MARGIN_SCALE, REVENUE_SCALE,
                      add_i_scatter, i_small_multiples, legend_top, heat_table, i_value)
 
@@ -51,14 +52,6 @@ except Exception:
 # --------------------------------------------------------------------------------
 # 改善 2：交易時間感知 TTL
 # --------------------------------------------------------------------------------
-def is_trading_hours() -> bool:
-    """判斷目前是否在台股交易時間內（週一至週五 09:00~13:30 台北時間）"""
-    now = datetime.now(ZoneInfo("Asia/Taipei"))
-    if now.weekday() >= 5:          # 六日
-        return False
-    t = now.time()
-    return dtime(9, 0) <= t <= dtime(13, 30)
-
 def market_ttl(intraday_sec: int, offhours_sec: int = 3600) -> int:
     """盤中使用 intraday_sec，盤後/假日使用 offhours_sec"""
     return intraday_sec if is_trading_hours() else offhours_sec
@@ -99,36 +92,17 @@ def _parse_i(i_str) -> float | None:
 def _batch_kd_analyze(
     stock_codes: list[str],
     progress_bar=None,
-    label_prefix: str = '正在分析'
+    label_prefix: str = '正在分析',
+    analyze_fn=None,
 ) -> dict[str, dict]:
     """
-    並發分析多檔股票（ThreadPoolExecutor, max_workers=4）。
-    自動去除無效代碼與重複項，回傳 {code: analysis_result}。
-    progress_bar: st.progress 物件（可選）
+    並發分析多檔股票（只算指標、不畫圖）。回傳 {code: analysis_result}。
+    progress_bar: st.progress 物件（可選）；analyze_fn 預設為 cached_analyze_stock。
     """
-    unique_codes = list(dict.fromkeys(c for c in stock_codes if c and c != 'nan'))
-    total = len(unique_codes)
-    if total == 0:
-        return {}
-    results: dict[str, dict] = {}
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        future_to_code = {
-            executor.submit(cached_analyze_stock, code): code
-            for code in unique_codes
-        }
-        for i, future in enumerate(as_completed(future_to_code), 1):
-            code = future_to_code[future]
-            try:
-                results[code] = future.result()
-            except Exception as exc:
-                results[code] = {
-                    'status': 'error',
-                    'error_type': 'unknown',
-                    'message': str(exc)
-                }
-            if progress_bar is not None:
-                progress_bar.progress(i / total, text=f"{label_prefix}: {code} ({i}/{total})")
-    return results
+    def _cb(i, total, code):
+        if progress_bar is not None:
+            progress_bar.progress(i / total, text=f"{label_prefix}: {code} ({i}/{total})")
+    return services.batch_analyze(stock_codes, analyze_fn or cached_analyze_stock, _cb)
 
 # --------------------------------------------------------------------------------
 # OPTIMIZATION: Cached Data Fetching Functions（動態 TTL 版）
@@ -137,50 +111,15 @@ def _batch_kd_analyze(
 # 失敗結果不快取：快取函式內遇到失敗一律 raise（st.cache_data 不會快取例外），
 # 外層包裝再轉回原本的 None / 錯誤 dict，讓既有的顯示邏輯不用改。
 # --------------------------------------------------------------------------------
-class _AnalyzeFailed(Exception):
-    """個股分析失敗；攜帶 analyze_stock 回傳的錯誤 dict。"""
-    def __init__(self, result: dict):
-        super().__init__(result.get('message', '分析失敗'))
-        self.result = result
-
-
 @st.cache_data(ttl=market_ttl(1800, 3600), show_spinner=False)   # 盤中30分鐘；盤後1小時
 def _cached_screen_103(params: dict) -> dict:
     """我的選股103（本機計算）。ScreenerError 直接往外拋，不會被快取。"""
-    res = screen_103(params=Screen103Params(**params))
-    n_cand = len(res.detail) + len(res.errors)
-    if n_cand and len(res.errors) * 2 > n_cand:
-        raise ScreenerError(
-            f"細篩有 {len(res.errors)}/{n_cand} 檔抓不到日線，可能是 FinMind 限流，請稍後再試"
-        )
-    return {
-        'matches': res.matches,
-        'trade_date': res.trade_date,
-        'prev_date': res.prev_date,
-        'source': res.source,
-        'universe_size': res.universe_size,
-        'n_candidates': n_cand,
-        'errors': res.errors,
-        'notes': res.notes,
-    }
+    return services.run_screen_103(params)
 
 @st.cache_data(ttl=market_ttl(1800, 21600), show_spinner=False)  # 盤中30分鐘；盤後6小時
 def _cached_screen_revenue(params: dict) -> dict:
     """月營收選股（本機計算）。ScreenerError 直接往外拋，不會被快取。"""
-    res = screen_revenue(params=RevenueParams(**params))
-    n_cand = len(res.detail) + len(res.errors)
-    if n_cand and len(res.errors) * 2 > n_cand:
-        raise ScreenerError(
-            f"同期排名有 {len(res.errors)}/{n_cand} 檔抓不到 FinMind 月營收，可能是限流，請稍後再試"
-        )
-    return {
-        'matches': res.matches,
-        'months_loaded': res.months_loaded,
-        'universe_size': res.universe_size,
-        'n_candidates': n_cand,
-        'errors': res.errors,
-        'notes': res.notes,
-    }
+    return services.run_screen_revenue(params)
 
 @st.cache_data(ttl=market_ttl(300, 3600))   # 盤中5分鐘；盤後1小時
 def _cached_fetch_concentration_data():
@@ -190,35 +129,27 @@ def _cached_fetch_concentration_data():
 def _cached_scrape_yahoo_rankings(url):
     return scrape_yahoo_stock_rankings(url)          # ScrapeError 往外拋，不進快取
 
-@st.cache_data(ttl=3600)
-def _cached_analyze_stock(stock_id: str) -> dict:
+@st.cache_data(ttl=3600, show_spinner=False)
+def _cached_price_history(stock_id: str) -> pd.DataFrame:
     """
-    改善 4：回傳值中的 chart_figure 已序列化為 JSON 字串，
-    避免 Plotly Figure 物件佔用大量快取記憶體。
-    失敗（例如 FinMind 429）時 raise，錯誤結果不進快取，下次會重抓。
+    改善 4（新版）：只快取日線（約 200 列、十幾 KB），指標與圖表都從它現算，
+    不再把每檔約 130KB 的圖表 JSON 塞進快取。失敗時 raise AnalysisError，不進快取。
     """
-    result = analyze_stock(stock_id)
-    if result.get('status') != 'success':
-        raise _AnalyzeFailed(result)
-    if 'chart_figure' in result:
-        result['chart_json'] = _fig_to_cache(result.pop('chart_figure'))
-    return result
+    return fetch_price_history(stock_id)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _cached_chart_json(stock_id: str, price_data: pd.DataFrame | None = None) -> str:
+    """只有使用者選擇看圖時才建圖；同一檔一小時內重看不重算。"""
+    if price_data is None:
+        price_data = _cached_price_history(stock_id)
+    return _fig_to_cache(build_chart(stock_id, price_data))
 
 
 # --------------------------------------------------------------------------------
 # 上次成功結果（last-known-good）：抓取成功就存一份；失敗時改顯示上次結果並標註時間
 # --------------------------------------------------------------------------------
-def _with_lkg(key: str, fn, *args):
-    """回傳 (data, stale)。stale 為 None 表示是最新資料；否則為 (saved_at, 錯誤)。"""
-    try:
-        data = fn(*args)
-    except (ScrapeError, ScreenerError) as e:
-        old = lkg_load(key)
-        if old is None:
-            raise
-        return old[0], (old[1], e)
-    lkg_save(key, data)
-    return data, None
+_with_lkg = services.with_lkg   # 回傳 (data, stale)；stale 為 None 表示是最新資料
 
 
 def _show_stale(label: str, stale) -> None:
@@ -250,11 +181,20 @@ def cached_scrape_yahoo_rankings(url):
         st.info("ℹ️ Yahoo 排行榜的主要解析方式失效，已改用備援解析；網頁可能改版，數字請再核對。")
     return data
 
-def cached_analyze_stock(stock_id: str) -> dict:
-    try:
-        return _cached_analyze_stock(stock_id)
-    except _AnalyzeFailed as e:
-        return e.result
+def cached_analyze_stock(stock_id: str, price_data: pd.DataFrame | None = None) -> dict:
+    """
+    個股指標（K、D、I 值、5 日均量），不畫圖。
+    price_data 有給（例如 103 細篩抓過的日線）就直接用，不再呼叫 FinMind。
+    """
+    if price_data is None:
+        try:
+            price_data = _cached_price_history(stock_id)
+        except AnalysisError as e:
+            return {'status': 'error', 'error_type': e.kind,
+                    'message': f"分析過程發生錯誤 ({stock_id}): {e}"}
+    res = analyze_stock(stock_id, with_chart=False, price_data=price_data)
+    res.pop('price_data', None)
+    return res
 
 @st.cache_data(ttl=86400)
 def cached_plot_revenue(stock_id: str):
@@ -270,13 +210,13 @@ def cached_plot_shareholders(stock_id: str):
 # 輔助函式
 # --------------------------------------------------------------------------------
 def show_analysis_error(stock_name: str, result: dict):
-    """改善 5：根據 error_type 顯示具體的錯誤提示，取代通用錯誤訊息。"""
+    """依 error_type 顯示具體的錯誤提示。"""
     error_type = result.get('error_type', 'unknown')
     msg = result.get('message', '未知錯誤')
     if error_type == 'rate_limit':
         st.warning(
-            f"⏳ **{stock_name}**：FinMind API 請求頻率超限（HTTP 429）。"
-            f"請稍後再試，或在 [FinMind](https://finmindtrade.com/) 升級方案。"
+            f"⏳ **{stock_name}**：FinMind 額度用完或請求太頻繁，請稍後再試，"
+            f"或在 [FinMind](https://finmindtrade.com/) 升級方案。"
         )
     elif error_type == 'network':
         st.warning(f"🌐 **{stock_name}**：網路連線失敗，請確認網路狀態後重試。")
@@ -286,12 +226,38 @@ def show_analysis_error(stock_name: str, result: dict):
         st.info(f"📊 **{stock_name}**：上市未滿60日，資料不足無法繪製技術分析圖。")
     else:
         st.error(f"❌ **{stock_name}** 分析失敗：{msg}")
-# 只保留普通股（4 碼、非 0 開頭）：排除 ETF／ETN／權證等 FinMind 常查無日線的商品
-_COMMON_STOCK_RE = re.compile(r'^[1-9]\d{3}$')
 
 
-def _is_common_stock(code) -> bool:
-    return bool(_COMMON_STOCK_RE.match(str(code).strip()))
+def render_stock_chart(stock_code: str, stock_name: str, price_data: pd.DataFrame | None = None,
+                       key: str | None = None) -> None:
+    """畫一張個股技術分析圖（只在需要時建圖）。"""
+    with st.spinner(f"正在產生 {stock_name} 的技術分析圖..."):
+        try:
+            chart_json = _cached_chart_json(stock_code, price_data)
+        except AnalysisError as e:
+            show_analysis_error(stock_name, {'error_type': e.kind, 'message': str(e)})
+            return
+        except Exception as e:                 # noqa: BLE001
+            show_analysis_error(stock_name, {'error_type': 'unknown', 'message': str(e)})
+            return
+    st.plotly_chart(_fig_from_cache(chart_json), width="stretch", key=key)
+
+
+def render_chart_picker(stocks: list[tuple[str, str]], key: str,
+                        histories: dict | None = None) -> None:
+    """
+    以下拉選單挑一檔看技術分析圖。原本每檔一個 expander，所有圖都會先建好；
+    改成選了才畫，大幅減少 FinMind 呼叫與記憶體。
+    """
+    if not stocks:
+        return
+    st.markdown("---")
+    st.subheader("🔍 個股技術分析圖")
+    labels = {f"{name} ({code})": (code, name) for code, name in stocks}
+    choice = st.selectbox("選擇要查看的股票", ["（請選擇）", *labels], key=f"pick_{key}")
+    if choice in labels:
+        code, name = labels[choice]
+        render_stock_chart(code, name, (histories or {}).get(code), key=f"chart_{key}_{code}")
 
 
 def _drop_no_data(df: pd.DataFrame, cache: dict, code_col: str = '代碼',
@@ -306,86 +272,32 @@ def _drop_no_data(df: pd.DataFrame, cache: dict, code_col: str = '代碼',
 
 
 def process_ranking_analysis(stock_df: pd.DataFrame) -> list:
+    """漲幅排行榜篩選（規則在 services.screen_ranking）。回傳通過者與分析失敗者，依排名排序。"""
     if stock_df is None or stock_df.empty:      # 失敗原因已由 cached_scrape_yahoo_rankings 顯示
         return []
+    params = st.session_state.get('filter_params', {})
+    min_price = params.get('min_price', 35)
+    min_change = params.get('min_change', 2.0)
+    vol_ratio = params.get('vol_ratio', 2.0)
 
-    # 改善 7：從 session_state 讀取使用者設定的篩選參數
-    params       = st.session_state.get('filter_params', {})
-    min_price    = params.get('min_price',  35)
-    min_change   = params.get('min_change',  2.0)
-    vol_ratio    = params.get('vol_ratio',   2.0)
+    progress_bar = st.progress(0, text="分析進度")
+    res = services.screen_ranking(
+        stock_df, cached_analyze_stock, min_price, min_change, vol_ratio,
+        progress_cb=lambda i, n, c: progress_bar.progress(i / n, text=f"正在分析: {c} ({i}/{n})"))
+    progress_bar.empty()
 
-    results_list = []
-    try:
-        # 初步篩選
-        for col in ['Price', 'Change Percent', 'Estimated Volume']:
-            if col in stock_df.columns:
-                stock_df[col] = pd.to_numeric(stock_df[col], errors='coerce')
-        condition = (stock_df['Price'] > min_price) & (stock_df['Change Percent'] > min_change)
-        filtered_df = stock_df[condition].copy().dropna(subset=['Price', 'Change Percent', 'Estimated Volume'])
-        non_common = ~filtered_df['Stock Symbol'].map(_is_common_stock)
-        if non_common.any():
-            names = [f"{n}({c})" for c, n in zip(filtered_df.loc[non_common, 'Stock Symbol'],
-                                                  filtered_df.loc[non_common, 'Stock Name'])]
-            st.caption(f"已排除 ETF／ETN 等非普通股 {len(names)} 檔：{'、'.join(names)}")
-            filtered_df = filtered_df[~non_common]
-
-        if filtered_df.empty:
-            st.warning(f"沒有任何股票符合初步篩選條件（成交價 > {min_price}、漲跌幅 > {min_change}%）。")
-            return []
-
-        st.info(f"初步篩選後有 {len(filtered_df)} 檔股票，開始進行併發分析...")
-        progress_bar = st.progress(0)
-        total_stocks = len(filtered_df)
-        
-        no_data: list[str] = []
-        with ThreadPoolExecutor(max_workers=4) as executor:  # 降低併發數，避免觸發 FinMind Rate Limit
-            future_to_stock = {
-                executor.submit(cached_analyze_stock, str(stock_info['Stock Symbol']).strip()): stock_info
-                for stock_info in filtered_df.to_dict('records')
-            }
-            
-            for i, future in enumerate(as_completed(future_to_stock)):
-                stock_info = future_to_stock[future]
-                result_item = {'stock_info': stock_info}
-                try:
-                    analysis_result = future.result()
-                    if analysis_result['status'] == 'success':
-                        indicators = analysis_result.get('indicators', {})
-                        avg_vol_5_lots = indicators.get('avg_vol_5', 0) / 1000 if indicators.get('avg_vol_5') else 0
-                        estimated_volume_lots = stock_info.get('Estimated Volume', 0)
-
-                        if pd.notna(estimated_volume_lots) and pd.notna(avg_vol_5_lots) and avg_vol_5_lots > 0 and estimated_volume_lots > (vol_ratio * avg_vol_5_lots):
-                            result_item.update({
-                                'error': None,
-                                'chart_json': analysis_result.get('chart_json'),
-                                'indicators': indicators,
-                                'estimated_volume_lots': estimated_volume_lots,
-                                'avg_vol_5_lots': avg_vol_5_lots
-                            })
-                            results_list.append(result_item)
-                    elif analysis_result.get('error_type') == 'no_data':
-                        no_data.append(f"{stock_info.get('Stock Name', '')}({stock_info.get('Stock Symbol', '')})")
-                    else:
-                        result_item['error'] = analysis_result.get('message', '未知錯誤')
-                        result_item['error_type'] = analysis_result.get('error_type', 'unknown')
-                        results_list.append(result_item)
-
-                except Exception as exc:
-                    result_item['error'] = f"分析時發生例外: {exc}"
-                    results_list.append(result_item)
-                
-                progress_bar.progress((i + 1) / total_stocks)
-        
-        if no_data:
-            st.caption(f"已略過 FinMind 查無資料的 {len(no_data)} 檔：{'、'.join(no_data)}")
-        if not any(not r.get('error') for r in results_list):
-            st.info("分析完成。沒有任何股票通過最終篩選條件。")
-
-    except Exception as e:
-        st.error(f"在篩選或分析過程中發生錯誤： {e}")
-
-    return sorted(results_list, key=lambda x: x['stock_info'].get('Rank', 999))
+    if res.excluded:
+        st.caption(f"已排除 ETF／ETN 等非普通股 {len(res.excluded)} 檔：{'、'.join(res.excluded)}")
+    if res.n_prelim == 0:
+        st.warning(f"沒有任何股票符合初步篩選條件（成交價 > {min_price}、漲跌幅 > {min_change}%）。")
+        return []
+    st.info(f"初步篩選後有 {res.n_prelim} 檔股票，已完成量能分析。")
+    if res.no_data:
+        st.caption(f"已略過 FinMind 查無資料的 {len(res.no_data)} 檔：{'、'.join(res.no_data)}")
+    if not res.passed:
+        st.info("分析完成。沒有任何股票通過最終篩選條件。")
+    passed = [{**r, 'error': None} for r in res.passed]
+    return passed + res.errors
 
 
 # --------------------------------------------------------------------------------
@@ -530,9 +442,11 @@ def display_concentration_results():
         if stock_data is not None:
             _conc_params  = st.session_state.get('filter_params', {})
             _min_vol_conc = _conc_params.get('min_vol_conc', 2000)
-            filtered_stocks = filter_stock_data(stock_data, min_volume=_min_vol_conc)
-            if filtered_stocks is not None:
-                filtered_stocks = filtered_stocks[filtered_stocks['代碼'].map(_is_common_stock)]
+            try:
+                filtered_stocks = services.filter_concentration(stock_data, _min_vol_conc)
+            except ValueError as e:
+                st.error(f"❌ {e}")
+                return
             
             if filtered_stocks is not None and not filtered_stocks.empty:
                 st.success(f"找到 {len(filtered_stocks)} 檔符合條件的股票，正在進行技術指標分析...")
@@ -584,17 +498,8 @@ def display_concentration_results():
                 # ── 整合遠端視覺化服務：直接在本地產生統計卡片與圖表 ──
                 display_concentration_visualization(filtered_stocks)
 
-                st.markdown("---")
-                st.subheader("🔍 個股技術分析圖")
-                for _, stock in filtered_stocks.iterrows():
-                    stock_code = str(stock['代碼'])
-                    stock_name = stock['股票名稱']
-                    with st.expander(f"查看 {stock_name} ({stock_code}) 的技術分析圖"):
-                        analysis_result = concentration_cache.get(stock_code) or cached_analyze_stock(stock_code)
-                        if analysis_result['status'] == 'success':
-                            st.plotly_chart(_fig_from_cache(analysis_result['chart_json']), width="stretch")
-                        else:
-                            show_analysis_error(stock_name, analysis_result)
+                render_chart_picker(
+                    [(str(r.代碼), str(r.股票名稱)) for r in filtered_stocks.itertuples()], key="conc")
             else:
                 st.warning("沒有找到或篩選出符合條件的股票。")
 
@@ -685,8 +590,12 @@ def display_my_103_results():
 
     st.success(f"共 {len(scraped_df)} 檔符合條件，正在進行技術指標分析...")
     raw_codes = [str(c).strip() for c in scraped_df['代碼']]
+    # 細篩已抓過符合者的日線：直接拿來算 I 值、畫圖，不再重抓 FinMind
+    histories = res.get('histories') or {}
     progress_bar = st.progress(0, text="分析進度")
-    analysis_cache = _batch_kd_analyze(raw_codes, progress_bar, label_prefix="正在分析")
+    analysis_cache = _batch_kd_analyze(
+        raw_codes, progress_bar, label_prefix="正在分析",
+        analyze_fn=lambda c: cached_analyze_stock(c, histories.get(c)))
     progress_bar.empty()
 
     # KD 直接用選股計算的日K/日D（與 Goodinfo 同算法）；I 值來自個股分析
@@ -695,7 +604,7 @@ def display_my_103_results():
     for code in raw_codes:
         result = analysis_cache.get(code, {'status': 'error'})
         i_val = result.get('indicators', {}).get('i_value') if result['status'] == 'success' else None
-        i_values.append(i_val if i_val is not None else ("錯誤" if result['status'] != 'success' else "N/A"))
+        i_values.append(f"{i_val:.0f}" if i_val is not None else ("錯誤" if result['status'] != 'success' else "N/A"))
     scraped_df['I值'] = [str(v) for v in i_values]  # 混型別會讓 Arrow 轉換失敗
 
     display_columns = [
@@ -707,16 +616,8 @@ def display_my_103_results():
     if {'量比', '週K變化', '月季線差(%)'}.issubset(scraped_df.columns):
         _plot_103_margins(scraped_df, params)
 
-    for _, stock in scraped_df.iterrows():
-        stock_code = str(stock['代碼']).strip()
-        stock_name = str(stock['名稱']).strip()
-        with st.expander(f"查看 {stock_name} ({stock_code}) 的技術分析圖"):
-            analysis_result = analysis_cache.get(stock_code) or cached_analyze_stock(stock_code)
-            if analysis_result['status'] == 'success':
-                st.plotly_chart(_fig_from_cache(analysis_result['chart_json']), width="stretch",
-                                key=f"chart103_{stock_code}")
-            else:
-                show_analysis_error(stock_name, analysis_result)
+    render_chart_picker([(str(r.代碼).strip(), str(r.名稱).strip()) for r in scraped_df.itertuples()],
+                        key="103", histories=histories)
 
 
 def display_monthly_revenue_visualization(df: pd.DataFrame):
@@ -909,7 +810,7 @@ def display_monthly_revenue_results():
     for note in res.get('notes', []):
         st.info(f"ℹ️ {note}")
     if res['errors']:
-        with st.expander(f"⚠️ {len(res['errors'])} 檔抓不到 FinMind 月營收，未納入同期排名判斷"):
+        with st.expander(f"⚠️ {len(res['errors'])} 檔抓不到歷年月營收，未納入同期排名判斷"):
             st.write(res['errors'])
 
     scraped_df = res['matches'].copy()
@@ -937,7 +838,7 @@ def display_monthly_revenue_results():
                 i_val = indicators.get('i_value')
                 k_values.append(f"{k_val:.2f}" if k_val is not None else "N/A")
                 d_values.append(f"{d_val:.2f}" if d_val is not None else "N/A")
-                i_values.append(i_val if i_val is not None else "N/A")
+                i_values.append(f"{i_val:.0f}" if i_val is not None else "N/A")
             else:
                 k_values.append("錯誤"); d_values.append("錯誤"); i_values.append("錯誤")
 
@@ -964,20 +865,8 @@ def display_monthly_revenue_results():
         # ── 整合遠端視覺化服務：直接在本地產生統計卡片與圖表 ──
         display_monthly_revenue_visualization(scraped_df)
 
-        st.markdown("---")
-        st.subheader("🔍 個股技術分析圖")
-        for _, stock in scraped_df.iterrows():
-            stock_code = str(stock['代碼']).strip()
-            stock_name = str(stock['名稱']).strip()
-            if not stock_code or stock_code == 'nan': continue
-
-            with st.expander(f"查看 {stock_name} ({stock_code}) 的技術分析圖"):
-                analysis_result = revenue_cache.get(stock_code) or cached_analyze_stock(stock_code)
-                if analysis_result['status'] == 'success':
-                    st.plotly_chart(_fig_from_cache(analysis_result['chart_json']), width="stretch",
-                                    key=f"chartrev_{stock_code}")
-                else:
-                    show_analysis_error(stock_name, analysis_result)
+        render_chart_picker([(str(r.代碼).strip(), str(r.名稱).strip()) for r in scraped_df.itertuples()
+                             if str(r.代碼).strip() not in ('', 'nan')], key="rev")
     else:
         st.warning("目前沒有符合全部條件的股票。")
 
@@ -1099,9 +988,11 @@ def display_ranking_visualization(summary_df: pd.DataFrame):
 
 def display_ranking_results(market_type: str):
     st.header(f"🚀 漲幅排行榜 ({market_type})")
-    st.info("篩選條件：\n1. 成交價 > 35元\n2. 漲跌幅 > 2%\n3. 預估成交量 > 2 倍前5日均量")
-    
-    url = "https://tw.stock.yahoo.com/rank/change-up?exchange=TAI" if market_type == "上市" else "https://tw.stock.yahoo.com/rank/change-up?exchange=TWO"
+    fp = st.session_state.get('filter_params', {})
+    st.info(f"篩選條件：\n1. 成交價 > {fp.get('min_price', 35)}元\n2. 漲跌幅 > {fp.get('min_change', 2.0)}%\n"
+            f"3. 預估成交量 > {fp.get('vol_ratio', 2.0)} 倍前5日均量（側邊欄可調整）")
+
+    url = services.YAHOO_RANK_URL[market_type]
     with st.spinner(f"正在爬取 Yahoo Finance ({market_type}) 的資料..."):
         stock_df = cached_scrape_yahoo_rankings(url)
     
@@ -1121,7 +1012,7 @@ def display_ranking_results(market_type: str):
                 
                 i_val = indicators.get('i_value')
                 # 這裡只儲存純文字值，不加入HTML標籤，以便 CSV 下載正確資料
-                i_text = str(i_val) if i_val is not None else "N/A"
+                i_text = f"{i_val:.0f}" if i_val is not None else "N/A"
 
                 display_data.append({
                     "排名": stock_info.get('Rank', ''),
@@ -1177,17 +1068,13 @@ def display_ranking_results(market_type: str):
             # ── 整合遠端視覺化服務：直接在本地產生統計卡片與圖表 ──
             display_ranking_visualization(summary_df)
 
-        st.markdown("---")
-        st.subheader("🔍 個股技術分析圖")
+        render_chart_picker([(str(r['stock_info']['Stock Symbol']), str(r['stock_info']['Stock Name']))
+                             for r in yahoo_results if not r.get('error')], key=f"rank_{market_type}")
         for result in yahoo_results:
-            if not result.get('error'):
-                stock_name = result['stock_info']['Stock Name']
-                stock_symbol = result['stock_info']['Stock Symbol']
-                with st.expander(f"查看 {stock_name} ({stock_symbol}) 的技術分析圖"):
-                    st.plotly_chart(_fig_from_cache(result['chart_json']), width="stretch")
-            else:
+            if result.get('error'):
                 stock_name = result['stock_info'].get('Stock Name', '未知股票')
-                show_analysis_error(stock_name, {'error_type': result.get('error_type', 'unknown'), 'message': result.get('error', '')})
+                show_analysis_error(stock_name, {'error_type': result.get('error_type', 'unknown'),
+                                                 'message': result.get('error', '')})
 
 
 def display_single_stock_analysis(stock_identifier: str):
@@ -1204,24 +1091,19 @@ def display_single_stock_analysis(stock_identifier: str):
         
         tab1, tab2, tab3 = st.tabs(["技術分析", "月營收趨勢", "大戶股權變化"])
         with tab1:
-            with st.spinner("正在生成技術分析圖..."):
-                tech_analysis_result = cached_analyze_stock(stock_code)
-                if tech_analysis_result['status'] == 'success':
-                    st.plotly_chart(_fig_from_cache(tech_analysis_result['chart_json']), width="stretch")
-                else:
-                    show_analysis_error(stock_name, tech_analysis_result)
+            render_stock_chart(stock_code, stock_name, key=f"tech_{stock_code}")
         with tab2:
             with st.spinner("正在生成月營收趨勢圖..."):
                 revenue_json, revenue_error = cached_plot_revenue(stock_code)
                 if not revenue_error:
-                    st.plotly_chart(_fig_from_cache(revenue_json), width="stretch")
+                    st.plotly_chart(_fig_from_cache(revenue_json), width="stretch", key=f"rev_{stock_code}")
                 else:
                     st.error(f"無法生成營收圖: {revenue_error}")
         with tab3:
             with st.spinner("正在生成大戶股權變化圖..."):
                 shareholder_json, shareholder_error = cached_plot_shareholders(stock_code)
                 if not shareholder_error:
-                    st.plotly_chart(_fig_from_cache(shareholder_json), width="stretch")
+                    st.plotly_chart(_fig_from_cache(shareholder_json), width="stretch", key=f"holders_{stock_code}")
                 else:
                     st.error(f"無法生成大戶股權圖: {shareholder_error}")
 
