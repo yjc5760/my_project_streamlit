@@ -263,24 +263,22 @@ def _run_rev(params: dict) -> dict:
 
 @mcp.tool()
 async def monthly_revenue_pick(
-    yoy_cur_min: float = 15.0,
-    yoy_prev_min: float = 10.0,
-    n_prev: int = 4,
-    top_n: int = 3,
+    lookback_years: int = 4,
+    yoy_min: float = 0.0,
     per_company_month: bool = False,
 ) -> dict:
-    """月營收選股（本機計算，等同 Goodinfo 月營收選股03）。
+    """月營收選股（本機計算）：今年每個月都創同期新高。
+
+    今年 1 月～當月逐月檢查：(A) 單月營收都高於過去 N 年同月份最高值；(B) 單月年增率都 > yoy_min。
+    結果依「最弱月超越前高(%)」由大到小排序。
 
     Args:
-        yoy_cur_min: 當月營收年增率下限（%）。
-        yoy_prev_min: 前幾個月年增率下限（%）。
-        n_prev: 連續檢查前幾個月（1～5）。
-        top_n: 當月營收須創歷年同期前 N 高（0 = 不檢查）。
-        per_company_month: True＝各公司以自己最新公告月份為當月；False（同 Goodinfo）＝全市場統一以最新公告月份為當月。
+        lookback_years: 每月營收須高於過去幾年同月份的最高值（預設 4 年）。
+        yoy_min: 每月年增率下限（%，須大於此值；預設 0）。
+        per_company_month: True＝各公司以自己今年最新公告月份為當月；False＝全市場統一以最新公告月份為當月（未公告者不入選）。
     """
     params = asdict(RevenueParams(
-        yoy_cur_min=float(yoy_cur_min), yoy_prev_min=float(yoy_prev_min), n_prev=n_prev,
-        top_n=top_n, months_to_load=max(6, n_prev + 2), per_company_month=per_company_month,
+        yoy_min=float(yoy_min), lookback_years=int(lookback_years), per_company_month=per_company_month,
     ))
     return await _in_thread(_run_rev, params)
 

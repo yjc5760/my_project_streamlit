@@ -185,7 +185,7 @@ def run_screen_revenue(params: dict) -> dict:
     n_cand = len(res.detail) + len(res.errors)
     if n_cand and len(res.errors) * 2 > n_cand:
         raise ScreenerError(
-            f"同期排名有 {len(res.errors)}/{n_cand} 檔抓不到公開資訊觀測站月營收，請稍後再試")
+            f"歷年同期比較有 {len(res.errors)}/{n_cand} 檔抓不到公開資訊觀測站月營收，請稍後再試")
     return {
         'matches': res.matches, 'months_loaded': res.months_loaded,
         'universe_size': res.universe_size, 'n_candidates': n_cand,

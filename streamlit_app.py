@@ -732,6 +732,8 @@ def display_monthly_revenue_visualization(df: pd.DataFrame):
                 if '同期排名' in h.columns:
                     h = h.assign(_rank=h['同期排名'].astype(str).str.split('/').str[0].astype(float))
                     h = h.sort_values(['_rank', yoy_col], ascending=[True, False])
+                elif '最弱月超越前高(%)' in h.columns:
+                    h = h.sort_values('最弱月超越前高(%)', ascending=False)
                 else:
                     h = h.sort_values(yoy_col, ascending=False)
                 labels = [f"{n_}({c_})" for n_, c_ in zip(h['名稱'], h['代碼'])]
@@ -749,7 +751,7 @@ def display_monthly_revenue_visualization(df: pd.DataFrame):
                                    title='單月營收年增率（左舊右新；顏色超過 100% 以最深色表示）',
                                    colorbar_title='年增率 %')
                 st.plotly_chart(fig_h, width="stretch")
-                st.caption("依同期排名、當月年增率排序。顏色越深代表成長越多；看整列是否一路深色，可判斷成長是否穩定。")
+                st.caption("依「最弱月超越前高」由大到小排序（最右欄為當月，往左依序是前幾個月）。顏色越深代表成長越多；看整列是否一路深色，可判斷成長是否穩定。")
 
             # ── 年增率 Top10：單一系列，用單色 ──
             elif tab_type == "yoy":
@@ -806,11 +808,12 @@ def display_monthly_revenue_results():
         _show_stale("月營收選股", stale)
 
     months_txt = "、".join(f"{y}/{m:02d}（{n}家）" for y, m, n in res['months_loaded'] if n)
-    st.caption(f"營收資料：{months_txt}　全市場 {res['universe_size']} 家 → 年增率條件 {res['n_candidates']} 家")
+    st.caption(f"營收資料：{months_txt}　全市場 {res['universe_size']} 家 → "
+               f"每月年增率皆 > {params.get('yoy_min', 0)}% 共 {res['n_candidates']} 家")
     for note in res.get('notes', []):
         st.info(f"ℹ️ {note}")
     if res['errors']:
-        with st.expander(f"⚠️ {len(res['errors'])} 檔抓不到歷年月營收，未納入同期排名判斷"):
+        with st.expander(f"⚠️ {len(res['errors'])} 檔抓不到歷年月營收，未納入歷年同期比較"):
             st.write(res['errors'])
 
     scraped_df = res['matches'].copy()
@@ -846,10 +849,11 @@ def display_monthly_revenue_results():
         scraped_df['I值'] = i_values
 
         st.info(f"""
-**篩選條件（本機計算，等同 Goodinfo 月營收選股03）：**
-1.  單月營收年增率 – 當月 ≥ {params['yoy_cur_min']}%（當月 = {'各公司最新公告月份' if params.get('per_company_month') else '全市場最新公告月份'}）
-2.  單月營收年增率 – 前1～{params['n_prev']}月皆 ≥ {params['yoy_prev_min']}%
-3.  單月營收創歷年同期前 {params['top_n']} 高
+**篩選條件（本機計算）：今年每個月都創同期新高**（當月 = {'各公司最新公告月份' if params.get('per_company_month') else '全市場最新公告月份'}）
+1.  今年 1 月～當月，**每個月**的單月營收都高於過去 {params['lookback_years']} 年同月份的最高值
+2.  今年 1 月～當月，**每個月**的單月營收年增率都 > {params['yoy_min']}%
+
+「最弱月超越前高(%)」＝今年各月中，超過歷年同月最高值幅度最小的那個月，數字越大代表領先越穩。
 """)
 
         all_cols = scraped_df.columns.tolist()
@@ -1150,15 +1154,13 @@ def main():
         p103_vr = st.slider("量增倍數（今 / 昨）", 1.0, 3.0, _d.vol_ratio, step=0.1, key="p103_vr")
     with st.sidebar.expander("月營收選股條件", expanded=False):
         _r = RevenueParams()
-        prev_cur = st.slider("當月年增率下限（%）", 0, 50, int(_r.yoy_cur_min), step=5, key="prev_cur")
-        prev_min = st.slider("前幾月年增率下限（%）", 0, 50, int(_r.yoy_prev_min), step=5, key="prev_min")
-        prev_n = st.slider("連續檢查前幾個月", 1, 5, _r.n_prev, key="prev_n")
-        prev_top = st.slider("創歷年同期前 N 高（0 = 不檢查）", 0, 5, _r.top_n, key="prev_top")
+        prev_years = st.slider("每月營收須高於過去幾年同月份", 1, 10, _r.lookback_years, key="prev_years",
+                               help="預設 4 年：今年每個月都要超過 2022～2025 年同月份的最高值")
+        prev_yoy = st.slider("每月年增率須大於（%）", 0, 50, int(_r.yoy_min), step=5, key="prev_yoy")
         prev_pc = st.checkbox("各公司以自己最新公告月份為當月", value=False, key="prev_pc",
-                              help="不勾選＝與 Goodinfo 相同，全市場統一以最新有公告的月份為當月")
+                              help="不勾選＝全市場統一以最新有公告的月份為當月，還沒公告的公司不入選")
     st.session_state['params_rev'] = asdict(RevenueParams(
-        yoy_cur_min=float(prev_cur), yoy_prev_min=float(prev_min), n_prev=prev_n, top_n=prev_top,
-        months_to_load=max(6, prev_n + 2), per_company_month=prev_pc,
+        yoy_min=float(prev_yoy), lookback_years=prev_years, per_company_month=prev_pc,
     ))
     st.session_state['params_103'] = asdict(Screen103Params(
         red_k_min=p103_red[0], red_k_max=p103_red[1], red_k_base=p103_base,
@@ -1215,4 +1217,4 @@ def main():
             display_single_stock_analysis(st.session_state.stock_id)
 
 if __name__ == "__main__":
-    main()
+    main()

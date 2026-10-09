@@ -1,25 +1,21 @@
 # revenue_screener.py
 """
-本機計算「月營收選股03」，取代 Goodinfo 爬蟲（monthly_revenue_scraper.scrape_goodinfo）。
+本機計算「月營收選股」：今年每個月都創同期新高。
 
-Goodinfo 原條件（FL_MARKET=上市/上櫃）：
-  1. 單月營收年增率 – 當月  > 15%
-  2. 單月營收年增率 – 前1月 > 10%
-  3. 單月營收年增率 – 前2月 > 10%
-  4. 單月營收年增率 – 前3月 > 10%
-  5. 單月營收年增率 – 前4月 > 10%
-  6. 單月營收創歷年同期前3高
+條件（今年 1 月～當月逐月檢查；當月＝全市場最新公告月份，例：10 月初為 9 月）：
+  A. 每個月的單月營收，都高於過去 N 年（預設 4 年，例：2022～2025）同月份的最高值
+     → 今年那條線每個月都在最上方，每個月都在創同期歷史新高。
+  B. 每個月的單月營收年增率（和去年同月比）都 > 門檻（預設 0%）→ 每個月都正成長。
+  （A 已經包含「高於去年同月」；B 是讓年增率門檻可以另外調高。）
 
-兩階段：
-  1. 粗篩（條件 1–5）：公開資訊觀測站「每月營業收入彙總表」近 6 個月（上市／上櫃 × 國內／KY）。
-     「當月」與 Goodinfo 相同：全市場統一取最新有資料的月份（例：10 月初為 9 月，
-     尚未公告 9 月營收的公司不會入選）；年增率直接取彙總表的「去年同月增減(%)」。
-  2. 細篩（條件 6）：同樣用彙總表往回抓歷年同月份（每個檔案含當年與去年，隔年抓一次），
-     比較營收排名；確定掉出前 N 名的就不再追蹤。不需呼叫 FinMind。
+資料來源：公開資訊觀測站「每月營業收入彙總表」（上市／上櫃 × 國內／KY），不需 FinMind。
+  1. 粗篩（條件 B）：抓今年 1 月～當月的彙總表，年增率取「去年同月增減(%)」。
+  2. 細篩（條件 A）：同樣用彙總表往回抓前幾年同月份（每個檔案含當年與去年，隔年抓一次），
+     只比對粗篩通過的公司。
 
 用法：
     python revenue_screener.py                     # 今天
-    python revenue_screener.py --diag 2330,6488    # 逐條件診斷
+    python revenue_screener.py --diag 2344,2330    # 逐月診斷
     python revenue_screener.py --detail rev.csv
 """
 from __future__ import annotations
@@ -28,6 +24,7 @@ import argparse
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from functools import lru_cache
 from datetime import date, timedelta
@@ -50,19 +47,16 @@ MARKETS = {"sii": "上市", "otc": "上櫃"}
 
 @dataclass
 class RevenueParams:
-    yoy_cur_min: float = 15.0        # 1. 當月年增率 >
-    yoy_prev_min: float = 10.0       # 2–5. 前 1~4 月年增率 >
-    n_prev: int = 4                  # 前幾個月要檢查
-    top_n: int = 3                   # 6. 創歷年同期前 N 高（0 = 不檢查）
-    months_to_load: int = 6          # 粗篩載入幾個月的彙總表
-    per_company_month: bool = False  # False（同 Goodinfo）：全市場統一以「最新有公告的月份」為當月
-                                     # True：各公司以自己最新公告的月份為當月
+    yoy_min: float = 0.0             # B. 今年每個月的單月年增率皆 > yoy_min（%）
+    lookback_years: int = 4          # A. 今年每個月的單月營收皆 > 過去 N 年同月份最高值
+    per_company_month: bool = False  # False：全市場統一以「最新有公告的月份」為當月（還沒公告的不入選）
+                                     # True：各公司以自己今年最新公告的月份為當月
 
 
 @dataclass
 class RevenueResult:
     matches: pd.DataFrame
-    detail: pd.DataFrame             # 所有粗篩候選股（含同期排名）
+    detail: pd.DataFrame             # 所有粗篩候選股（含逐月營收、前高、是否符合）
     as_of: date
     months_loaded: list              # [(年, 月, 公司數), ...]
     universe_size: int
@@ -164,108 +158,142 @@ def _shift(ym: int, k: int) -> int:
     return (idx // 12) * 100 + idx % 12 + 1
 
 
-def load_revenue_months(as_of: date, n: int) -> tuple[pd.DataFrame, list]:
-    """載入 as_of 前 n 個月份（不含 as_of 當月）的彙總表。"""
+def find_latest_month(as_of: date, max_back: int = 3) -> int:
+    """全市場最新有公告的月份（從 as_of 前一個月往回找），回傳 yyyymm。"""
     cur = as_of.year * 100 + as_of.month
-    frames, loaded = [], []
-    for k in range(1, n + 1):
+    for k in range(1, max_back + 1):
         ym = _shift(cur, -k)
-        df = fetch_mops_month(ym // 100, ym % 100)
-        loaded.append((ym // 100, ym % 100, len(df)))
-        if not df.empty:
-            frames.append(df)
-    if not frames:
-        raise ScreenerError("公開資訊觀測站沒有任何月份的營收彙總資料")
-    all_ = pd.concat(frames, ignore_index=True)
-    all_ = all_[all_["code"].str.match(_COMMON_STOCK)]
-    return all_.drop_duplicates(["code", "ym"]), loaded
+        if not fetch_mops_month(ym // 100, ym % 100).empty:
+            return ym
+    raise ScreenerError(f"公開資訊觀測站找不到 {as_of} 之前 {max_back} 個月內的營收彙總表")
+
+
+def _fetch_months(yms: list[int], max_workers: int = 4,
+                  progress_cb: Callable[[int, int, str], None] | None = None,
+                  label: str = "") -> dict[int, pd.DataFrame]:
+    """平行抓多個年月的彙總表（已快取的不會重抓）。連線失敗會拋 ScreenerError。"""
+    out: dict[int, pd.DataFrame] = {}
+    if not yms:
+        return out
+    with ThreadPoolExecutor(max_workers=max(1, max_workers)) as ex:
+        futs = {ex.submit(fetch_mops_month, ym // 100, ym % 100): ym for ym in yms}
+        for done, f in enumerate(as_completed(futs), 1):
+            ym = futs[f]
+            out[ym] = f.result()
+            if progress_cb:
+                progress_cb(done, len(futs), f"{label}{ym // 100}/{ym % 100:02d}")
+    return out
+
+
+def load_year_months(year: int, last_month: int, max_workers: int = 4,
+                     progress_cb: Callable[[int, int, str], None] | None = None
+                     ) -> tuple[pd.DataFrame, list]:
+    """載入 year 年 1 月～last_month 月的彙總表（只留普通股）。"""
+    yms = [year * 100 + m for m in range(1, last_month + 1)]
+    got = _fetch_months(yms, max_workers, progress_cb, "今年 ")
+    loaded = [(ym // 100, ym % 100, len(got[ym])) for ym in yms]
+    missing = [f"{y}/{m:02d}" for y, m, n in loaded if n == 0]
+    if missing:
+        raise ScreenerError(f"公開資訊觀測站缺少 {'、'.join(missing)} 的營收彙總表，無法逐月比較")
+    rev = pd.concat(got.values(), ignore_index=True)
+    rev = rev[rev["code"].str.match(_COMMON_STOCK)]
+    return rev.drop_duplicates(["code", "ym"]), loaded
 
 
 # ---------------------------------------------------------------------------
-# 粗篩：條件 1–5
+# 粗篩：條件 B（今年每個月年增率 > 門檻）
 # ---------------------------------------------------------------------------
-def coarse_revenue(rev: pd.DataFrame, p: RevenueParams) -> pd.DataFrame:
-    latest = rev.groupby("code")["ym"].max().rename("latest_ym")
-    if not p.per_company_month:
-        # Goodinfo 的「當月」是全市場同一個月（例：10 月初就是 26M09），
-        # 還沒公告該月營收的公司，當月年增率為空值 → 不通過
-        latest[:] = rev["ym"].max()
-    piv = rev.pivot(index="code", columns="ym", values="yoy")
-    out = []
-    for code, lym in latest.items():
-        yoys = [piv.at[code, _shift(lym, -i)] if _shift(lym, -i) in piv.columns else np.nan
-                for i in range(p.n_prev + 1)]
-        out.append({"code": code, "latest_ym": lym,
-                    **{("yoy_cur" if i == 0 else f"yoy_prev{i}"): v for i, v in enumerate(yoys)}})
-    df = pd.DataFrame(out)
+def coarse_revenue(rev: pd.DataFrame, year: int, last_month: int, p: RevenueParams) -> pd.DataFrame:
+    """
+    回傳每家公司一列：rev_m（今年 m 月營收）、y1_m（去年 m 月）、yoy_m（m 月年增率），
+    n_months（要檢查到幾月）、當月的 revenue / mom / yoy_cur，以及 pass_yoy。
+    """
+    rev = rev.copy()
+    rev["month"] = rev["ym"] % 100
+    calc = (rev["revenue"] / rev["rev_last_year"] - 1) * 100       # 彙總表沒填年增率時自己算
+    rev["yoy"] = rev["yoy"].where(rev["yoy"].notna(), calc.where(rev["rev_last_year"] > 0))
+    months = list(range(1, last_month + 1))
+    piv = {c: rev.pivot(index="code", columns="month", values=c).reindex(columns=months).astype(float)
+           for c in ("revenue", "rev_last_year", "yoy", "mom")}
+    codes = piv["revenue"].index
+
+    if p.per_company_month:
+        has = piv["revenue"].notna().to_numpy()
+        last = np.where(has.any(axis=1), last_month - np.argmax(has[:, ::-1], axis=1), 0)
+    else:
+        # 全市場同一個當月：還沒公告當月營收的公司，當月年增率為空值 → 不通過
+        last = np.full(len(codes), last_month)
+
+    yoy = piv["yoy"].to_numpy()
+    in_range = np.arange(1, last_month + 1)[None, :] <= last[:, None]
+    ok = np.where(in_range, yoy > p.yoy_min, True).all(axis=1) & (last > 0)   # NaN → 不通過
+
+    df = pd.DataFrame({"code": codes, "latest_ym": year * 100 + last, "n_months": last})
     names = rev.sort_values("ym").groupby("code").last()[["name", "market"]]
-    cur = rev.set_index(["code", "ym"])[["revenue", "rev_last_year", "mom"]]
     df = df.join(names, on="code")
-    keys = list(zip(df["code"], df["latest_ym"]))
-    for col in ("revenue", "rev_last_year", "mom"):
-        df[col] = [cur[col].get(k, np.nan) for k in keys]
-    # Goodinfo 範圍「15 ~ 空白」視為 >= 15
-    ok = df["yoy_cur"] >= p.yoy_cur_min
-    for i in range(1, p.n_prev + 1):
-        ok &= df[f"yoy_prev{i}"] >= p.yoy_prev_min       # NaN（缺月份）→ 不通過
+    for m in months:
+        df[f"rev_{m}"] = piv["revenue"][m].to_numpy()
+        df[f"y1_{m}"] = piv["rev_last_year"][m].to_numpy()
+        df[f"yoy_{m}"] = piv["yoy"][m].to_numpy()
+    rows, idx = np.arange(len(codes)), np.clip(last, 1, None) - 1
+    for col, src in (("revenue", "revenue"), ("mom", "mom"), ("yoy_cur", "yoy")):
+        df[col] = np.where(last > 0, piv[src].to_numpy()[rows, idx], np.nan)
     df["pass_yoy"] = ok
     return df
 
 
 # ---------------------------------------------------------------------------
-# 細篩：條件 6 歷年同期排名
+# 細篩：條件 A（今年每個月營收 > 過去 N 年同月份最高）
 # ---------------------------------------------------------------------------
-def same_month_ranks(cands: pd.DataFrame, p: RevenueParams, max_years: int = 30,
-                     progress_cb: Callable[[int, int, str], None] | None = None) -> pd.DataFrame:
+def _hist_file_years(year: int, n: int) -> list[int]:
+    """過去 n 年（year-2 起）需要抓哪些年份的檔案；每個檔案含當年與去年。去年已在今年的檔案裡。"""
+    return list(range(year - 2, year - n - 1, -2))
+
+
+def same_month_ceiling(cands: pd.DataFrame, year: int, last_month: int, p: RevenueParams,
+                       max_workers: int = 4,
+                       progress_cb: Callable[[int, int, str], None] | None = None
+                       ) -> tuple[pd.DataFrame, list]:
     """
-    條件 6：當月營收在「歷年同月份」中的名次。
-    資料來源同為公開資訊觀測站彙總表：每個年份的檔案同時含「當月」與「去年當月」，
-    所以每隔兩年抓一次即可。某檔已確定落到前 N 名之外就不再追蹤；
-    全部確定（或抓到沒有資料的年份）就提早停止。
-    回傳 cands 加上 same_month_rank、years_compared、match 欄位。
+    補上 yk_m（year-k 年 m 月營收，k = 1..N）、ceil_m（過去 N 年 m 月最高）、
+    beat_m（今年 m 月超過前高幾 %）、min_beat（最弱的那個月超過前高幾 %）、match。
+    歷史年份沒有資料（例如當時尚未上市）的不列入比較。
+    回傳 (結果, 缺少的彙總表年月清單)。
     """
     out = cands.copy().reset_index(drop=True)
-    out["exceed"] = (out["rev_last_year"] > out["revenue"]).astype(int)   # 去年同月
-    out["years_compared"] = 1 + out["rev_last_year"].notna().astype(int)
+    n_years = max(1, int(p.lookback_years))
+    months = list(range(1, last_month + 1))
+    fys = _hist_file_years(year, n_years)
+    got = _fetch_months([fy * 100 + m for fy in fys for m in months], max_workers, progress_cb, "歷年 ")
+    missing = []
+    for m in months:
+        cols = [f"y1_{m}"]
+        for fy in fys:
+            h = got[fy * 100 + m]
+            if h.empty:
+                missing.append(f"{fy}/{m:02d}")
+                h = pd.DataFrame(columns=["code", "revenue", "rev_last_year"])
+            h = h.drop_duplicates("code").set_index("code")
+            k = year - fy
+            out[f"y{k}_{m}"] = out["code"].map(h["revenue"]).astype(float)
+            cols.append(f"y{k}_{m}")
+            if k + 1 <= n_years:
+                out[f"y{k + 1}_{m}"] = out["code"].map(h["rev_last_year"]).astype(float)
+                cols.append(f"y{k + 1}_{m}")
+        out[f"ceil_{m}"] = out[cols].max(axis=1, skipna=True)
+        out[f"beat_{m}"] = (out[f"rev_{m}"] / out[f"ceil_{m}"] - 1) * 100
 
-    groups = list(out.groupby("latest_ym").groups.items())
-    total_steps = max(1, len(groups) * (max_years // 2))
-    step = 0
-    for lym, idx in groups:
-        y, m = divmod(int(lym), 100)
-        yy, empty_streak = y - 2, 0
-        while yy > y - max_years:
-            step += 1
-            pending = [i for i in idx if out.at[i, "exceed"] < p.top_n
-                       and pd.notna(out.at[i, "revenue"])]
-            if not pending:
-                break
-            if progress_cb:
-                progress_cb(min(step, total_steps), total_steps, f"{yy}/{m:02d}")
-            print(f"[月營收] 同期排名：比對 {yy}/{m:02d}、{yy - 1}/{m:02d}，待定 {len(pending)} 檔")
-            hist = fetch_mops_month(yy, m)
-            if hist.empty:
-                empty_streak += 1
-                if empty_streak >= 2:                   # 已抓到資料起始年之前
-                    break
-                yy -= 2
-                continue
-            empty_streak = 0
-            h = hist.set_index("code")
-            for i in pending:
-                code = out.at[i, "code"]
-                if code not in h.index:
-                    continue
-                cur = out.at[i, "revenue"]
-                for col in ("revenue", "rev_last_year"):
-                    v = h.at[code, col]
-                    if pd.notna(v):
-                        out.at[i, "years_compared"] += 1
-                        out.at[i, "exceed"] += int(v > cur)
-            yy -= 2
-    out["same_month_rank"] = (out["exceed"] + 1).where(out["revenue"].notna())   # 未公告 → NaN
-    out["match"] = (p.top_n <= 0) | (out["same_month_rank"] <= p.top_n)
-    return out.drop(columns="exceed")
+    n = out["n_months"].to_numpy()
+    ok = n > 0
+    min_beat = np.full(len(out), np.inf)
+    for m in months:
+        active = m <= n
+        r, c = out[f"rev_{m}"].to_numpy(float), out[f"ceil_{m}"].to_numpy(float)
+        ok &= ~active | (r > c)                                  # 前高為 NaN → 不通過
+        min_beat = np.where(active, np.fmin(min_beat, out[f"beat_{m}"].to_numpy(float)), min_beat)
+    out["min_beat"] = np.where(np.isfinite(min_beat), min_beat, np.nan)
+    out["match"] = ok
+    return out, missing
 
 
 # ---------------------------------------------------------------------------
@@ -291,41 +319,47 @@ def latest_quotes(as_of: date, max_back: int = 10) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 # 對外介面
 # ---------------------------------------------------------------------------
+def _ym_txt(v: int) -> str:
+    return f"{v // 100}/{v % 100:02d}"
+
+
 def screen_revenue(as_of=None, params: RevenueParams | None = None, max_workers: int = 4,
                    progress_cb: Callable[[int, int, str], None] | None = None,
                    with_quotes: bool = True) -> RevenueResult:
     p = params or RevenueParams()
     as_of = _to_date(as_of)
-    rev, loaded = load_revenue_months(as_of, p.months_to_load)
-    coarse = coarse_revenue(rev, p)
+    year, last_month = divmod(find_latest_month(as_of), 100)
+    rev, loaded = load_year_months(year, last_month, max_workers, progress_cb)
+    coarse = coarse_revenue(rev, year, last_month, p)
     cands = coarse[coarse["pass_yoy"]].reset_index(drop=True)
     print(f"[月營收] 載入月份 {[(f'{y}/{m:02d}', n) for y, m, n in loaded]}")
-    print(f"[月營收] 全市場 {len(coarse)} 檔 → 年增率條件 {len(cands)} 檔")
+    print(f"[月營收] 全市場 {len(coarse)} 檔 → {year} 年 1～{last_month} 月年增率皆 > {p.yoy_min}%：{len(cands)} 檔")
 
     notes, errors = [], {}
-    if p.top_n > 0 and len(cands):
-        detail = same_month_ranks(cands, p, progress_cb=progress_cb)
+    if len(cands):
+        detail, missing = same_month_ceiling(cands, year, last_month, p, max_workers, progress_cb)
+        if missing:
+            notes.append(f"公開資訊觀測站缺少 {'、'.join(missing)} 的彙總表，這些年月未納入前高比較")
     else:
-        detail = cands.assign(match=True)
+        detail = cands.assign(match=False, min_beat=np.nan)
 
-    if detail.empty:
-        hit = detail
-    else:
-        hit = detail[detail["match"]].copy()
-    print(f"[月營收] 符合全部條件：{len(hit)} 檔")
+    hit = detail[detail["match"]].sort_values("min_beat", ascending=False)
+    print(f"[月營收] 每個月都高於過去 {p.lookback_years} 年同月份：{len(hit)} 檔")
 
-    cols = {
-        "代碼": hit.get("code"), "名稱": hit.get("name"), "市場": hit.get("market"),
-        "營收月份": hit["latest_ym"].map(lambda v: f"{v // 100}/{v % 100:02d}") if len(hit) else None,
-        "單月營收(億)": (hit["revenue"] / 1e8).round(2) if len(hit) else None,
-        "月增(%)": hit.get("mom"), "年增(%)": hit.get("yoy_cur"),
-    }
-    for i in range(1, p.n_prev + 1):
-        cols[f"前{i}月年增(%)"] = hit.get(f"yoy_prev{i}")
-    if "same_month_rank" in hit:
-        cols["同期排名"] = hit["same_month_rank"].astype(int).astype(str) + "/" + \
-            hit["years_compared"].astype(int).astype(str)
-    matches = pd.DataFrame(cols).reset_index(drop=True) if len(hit) else pd.DataFrame(columns=list(cols))
+    recs = []
+    for r in hit.to_dict("records"):
+        n = int(r["n_months"])
+        rec = {"代碼": r["code"], "名稱": r["name"], "市場": r["market"],
+               "營收月份": _ym_txt(int(r["latest_ym"])), "檢查月份": f"1～{n}月",
+               "單月營收(億)": round(r["revenue"] / 1e8, 2),
+               "月增(%)": r["mom"], "年增(%)": r["yoy_cur"],
+               "最弱月超越前高(%)": round(r["min_beat"], 1)}
+        for k in range(1, n):                                    # 熱度表用：前k月 = 當月往前 k 個月
+            rec[f"前{k}月年增(%)"] = r[f"yoy_{n - k}"]
+        recs.append(rec)
+    base_cols = ["代碼", "名稱", "市場", "營收月份", "檢查月份", "單月營收(億)", "月增(%)",
+                 "年增(%)", "最弱月超越前高(%)"]
+    matches = pd.DataFrame(recs) if recs else pd.DataFrame(columns=base_cols)
 
     if with_quotes and len(matches):
         try:
@@ -343,63 +377,57 @@ def screen_revenue(as_of=None, params: RevenueParams | None = None, max_workers:
 def diagnose(codes: list[str], as_of=None, p: RevenueParams | None = None) -> None:
     p = p or RevenueParams()
     as_of = _to_date(as_of)
-    rev, loaded = load_revenue_months(as_of, p.months_to_load)
-    print("載入月份（年, 月, 公司數）：", loaded)
-    coarse = coarse_revenue(rev, p).set_index("code")
+    year, lm = divmod(find_latest_month(as_of), 100)
+    rev, loaded = load_year_months(year, lm)
+    print("今年載入月份（年, 月, 公司數）：", loaded)
+    coarse = coarse_revenue(rev, year, lm, p)
+    sel = coarse[coarse["code"].isin(codes)]
+    det = same_month_ceiling(sel, year, lm, p)[0].set_index("code") if len(sel) else pd.DataFrame()
+    N = max(1, int(p.lookback_years))
+    yrs = [year] + [year - k for k in range(1, N + 1)]
     for code in codes:
         print(f"\n===== {code} =====")
-        if code not in coarse.index:
-            print("  ✗ 不在營收彙總表中")
+        if code not in det.index:
+            print("  ✗ 不在今年的營收彙總表中")
             continue
-        r = coarse.loc[code]
-        lym = int(r["latest_ym"])
-        print(f"  {r['name']}（{r['market']}） 最新營收月份 {lym // 100}/{lym % 100:02d}"
-              f"  營收 {r['revenue'] / 1e8:.2f} 億")
-        print(f"  {'✓' if r['yoy_cur'] > p.yoy_cur_min else '✗'} 1 當月年增: {r['yoy_cur']}")
-        for i in range(1, p.n_prev + 1):
-            v = r[f"yoy_prev{i}"]
-            print(f"  {'✓' if v > p.yoy_prev_min else '✗'} {i + 1} 前{i}月年增"
-                  f"（{_shift(lym, -i) // 100}/{_shift(lym, -i) % 100:02d}）: {v}")
-        if pd.isna(r["revenue"]):
-            print(f"  ✗ 6 歷年同期排名：尚未公告 {lym // 100}/{lym % 100:02d} 營收，無法比較")
-            continue
-        one = same_month_ranks(coarse.loc[[code]].reset_index(),
-                               RevenueParams(top_n=999))          # 不提早停止，算出完整名次
-        rk, yrs = int(one.at[0, "same_month_rank"]), int(one.at[0, "years_compared"])
-        print(f"  {'✓' if rk <= p.top_n else '✗'} 6 歷年同期排名: {rk} / {yrs} 年")
-        # 列出歷年同月營收，方便和 Goodinfo 個股月營收頁對照
-        y, m = divmod(lym, 100)
-        series = {y: r["revenue"], y - 1: r["rev_last_year"]}
-        for yy in range(y - 2, y - 30, -2):
-            h = fetch_mops_month(yy, m)            # 已快取，不會重抓
-            if h.empty:
-                continue
-            h = h.set_index("code")
-            if code in h.index:
-                series.setdefault(yy, h.at[code, "revenue"])
-                series.setdefault(yy - 1, h.at[code, "rev_last_year"])
-        top = sorted(((v, k) for k, v in series.items() if pd.notna(v)), reverse=True)[:6]
-        print("    歷年同月營收前 6（億）：" +
-              "、".join(f"{k}/{m:02d}={v / 1e8:.2f}" for v, k in top))
+        r = det.loc[code]
+        n = int(r["n_months"])
+        print(f"  {r['name']}（{r['market']}） 檢查 {year}/01～{year}/{max(n, 1):02d}（單位：億）")
+        print("  月份" + "".join(f"{y:>9}" for y in yrs) + f"{'前高':>8}{'年增%':>8}   A  B")
+        for m in range(1, lm + 1):
+            vals = [r[f"rev_{m}"]] + [r.get(f"y{k}_{m}", np.nan) for k in range(1, N + 1)]
+            cells = "".join(f"{v / 1e8:9.2f}" if pd.notna(v) else f"{'–':>9}" for v in vals)
+            ceil, yoy = r[f"ceil_{m}"], r[f"yoy_{m}"]
+            if m > n:
+                flags = "（未公告，不檢查）"
+            else:
+                flags = f"   {'✓' if r[f'rev_{m}'] > ceil else '✗'}  {'✓' if yoy > p.yoy_min else '✗'}"
+            ceil_txt = f"{ceil / 1e8:8.2f}" if pd.notna(ceil) else f"{'–':>8}"
+            yoy_txt = f"{yoy:8.1f}" if pd.notna(yoy) else f"{'–':>8}"
+            print(f"  {m:>2}月{cells}{ceil_txt}{yoy_txt}{flags}")
+        print(f"  {'✓' if r['match'] else '✗'} A 每月都高於過去 {N} 年同月份最高"
+              f"（最弱月超越 {r['min_beat']:.1f}%）")
+        print(f"  {'✓' if r['pass_yoy'] else '✗'} B 每月年增率皆 > {p.yoy_min}%")
 
 
 def _main():
-    ap = argparse.ArgumentParser(description="本機計算 Goodinfo「月營收選股03」")
+    ap = argparse.ArgumentParser(description="本機計算月營收選股：今年每個月都創同期新高")
     ap.add_argument("--date", help="基準日 YYYY-MM-DD（預設今天）")
-    ap.add_argument("--diag", help="逐條件診斷指定代碼，例如 --diag 2330,6488")
+    ap.add_argument("--diag", help="逐月診斷指定代碼，例如 --diag 2344,2330")
+    ap.add_argument("--years", type=int, default=4, help="和過去幾年同月份比較（預設 4）")
+    ap.add_argument("--yoy-min", type=float, default=0.0, help="每月年增率門檻 %%（預設 0）")
     ap.add_argument("--detail", help="輸出所有候選股明細 CSV")
     a = ap.parse_args()
+    p = RevenueParams(yoy_min=a.yoy_min, lookback_years=a.years)
     if a.diag:
-        diagnose([c.strip() for c in a.diag.split(",") if c.strip()], a.date)
+        diagnose([c.strip() for c in a.diag.split(",") if c.strip()], a.date, p)
         return
-    res = screen_revenue(a.date)
+    res = screen_revenue(a.date, p)
     pd.set_option("display.width", 220)
     pd.set_option("display.max_columns", 30)
     print(res.matches.to_string(index=False) if not res.matches.empty else "（無符合股票）")
     for n in res.notes:
         print("注意：", n)
-    if res.errors:
-        print("細篩失敗：", res.errors)
     if a.detail and not res.detail.empty:
         res.detail.to_csv(a.detail, index=False, encoding="utf-8-sig")
         print(f"候選股明細 → {a.detail}")
