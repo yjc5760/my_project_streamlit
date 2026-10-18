@@ -28,6 +28,13 @@ def ohlcv():
 
 
 @pytest.fixture(autouse=True)
+def _no_disk_memo(monkeypatch):
+    """測試預設不讀寫磁碟快取（.cache/memo/），避免結果互相影響或寫進專案資料夾。"""
+    monkeypatch.setenv("DISABLE_DISK_MEMO", "1")
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _no_network(monkeypatch):
     """測試一律不連網：休市日表當作空的（只判斷週末）。"""
     import market_calendar

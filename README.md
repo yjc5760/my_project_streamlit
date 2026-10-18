@@ -125,7 +125,7 @@ python revenue_screener.py --diag 2402,6712       # 逐條件診斷＋歷年同�
 
 ## MCP Server（給 Antigravity 等 AI 工具呼叫）
 
-`mcp_server.py` 把側邊欄的 6 個功能開放成 MCP 工具，在本機以 stdio 執行。Streamlit Cloud 只執行 `streamlit_app.py`、只安裝 `requirements.txt`，不受影響。
+`mcp_server.py` 把側邊欄的 6 個功能開放成 MCP 工具（另有 `quality_pick`、`drawdown_backtest`、`financial_snapshot`、`earnings_call_materials` 四個目前只有 MCP 版），在本機以 stdio 執行。Streamlit Cloud 只執行 `streamlit_app.py`、只安裝 `requirements.txt`，不受影響。
 
 | 工具 | 對應功能 |
 |---|---|
@@ -134,6 +134,10 @@ python revenue_screener.py --diag 2402,6712       # 逐條件診斷＋歷年同�
 | `monthly_revenue_pick` | 月營收選股（本機計算） |
 | `gain_ranking` | 漲幅排行榜，`market` = 上市／上櫃 |
 | `stock_analysis` | 個股分析：K、D、I 值，三張圖另存成 `mcp_output/*.html` |
+| `quality_pick` | 四條件選股：月營收選股 → ② 營收 YoY 不減速 → ③ MA5、MA10 > MA20 → ① 大戶（>400 張）持續增加 → ④ 營業現金流 TTM 連續上升；回傳各關通過檔數與每檔卡關原因 |
+| `drawdown_backtest` | 回檔門檻回測（還原股價）：自 60 日高點回檔 10／15／20／25% 買進、持有 60 日的勝率、中位數、最差報酬、最大浮虧，並和任選一天買進的基準比較 |
+| `financial_snapshot` | 季報指標表：營收、毛利率、營益率、淨利率、EPS 的本季值與 QoQ／YoY、近 8 季趨勢；附業外占比與現金轉換率警示 |
+| `earnings_call_materials` | 法說會簡報：查公開資訊觀測站法人說明會一覽，下載最近幾次中文簡報 PDF 到 `mcp_output/` 並抽出文字（需 `pypdf`） |
 
 安裝（Windows，獨立虛擬環境，不影響原本的環境）：
 
@@ -163,3 +167,15 @@ FinMind token 會自動讀取 `.streamlit/secrets.toml`；也可以在設定檔�
 | 大戶持股 | norway.twsthr.info |
 
 本工具僅供研究參考，不構成任何投資建議。
+
+## 我的選股103 回測
+
+`backtest_103.py` 用和 `local_screener` 完全相同的 8 個條件逐日回測（測試保證與 `evaluate_103` 一致）。
+
+```
+.venv-mcp\Scripts\python backtest_103.py fetch   # 抓 2018-06 起全市場日線到 .cache/bt103/（約 3 小時，可中斷續抓）
+.venv-mcp\Scripts\python backtest_103.py run     # 離線回測，結果在 mcp_output/backtest_103/（trades.csv、summary.json）
+```
+
+隔日開盤進場、扣來回 0.585% 成本、報酬用還原價；比較固定持有天數、停損停利規則、全市場基準，並逐一拿掉條件看貢獻。
+已知偏誤：股票池為目前仍上市櫃的普通股（存活者偏誤）。

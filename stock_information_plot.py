@@ -1,10 +1,10 @@
 import pandas as pd
 import numpy as np
 import datetime
-import requests
 import twstock
 
 import finmind_client
+from scrape_utils import ScrapeError, disk_memo, fetch_html
 from bs4 import BeautifulSoup
 from io import StringIO
 
@@ -32,9 +32,68 @@ def get_stock_code(stock_identifier):
         print(f"在 twstock 中查找 '{stock_identifier}' 時發生錯誤: {e}")
         return None
 
+HOLDERS_URL = 'https://norway.twsthr.info/StockHolders.aspx?stock={code}'
+HOLDERS_PCT_COL = '>400張大股東持有百分比'
+
+
+@disk_memo("holders", 12 * 3600)                    # 週資料：12 小時內不重抓
+def fetch_major_holders(stock_code):
+    """
+    抓集保大戶（持股 > 400 張）週資料。回傳 DataFrame（新到舊）：資料日期, >400張大股東持有百分比。
+    連線失敗／被擋 raise ScrapeError（已重試、已分類）；頁面／欄位結構異常 raise ValueError。
+    繪圖（plot_stock_major_shareholders）與選股（quality_screener）共用。
+    """
+    stock_code = str(stock_code).strip()
+    html = fetch_html(HOLDERS_URL.format(code=stock_code), label="大戶持股（norway.twsthr.info）",
+                      encoding='utf-8')
+
+    soup = BeautifulSoup(html, 'lxml')
+    table = soup.select_one('#Details')
+    if not table:
+        raise ValueError(f"在股票 {stock_code} 的資料頁面中找不到持股資料表。")
+
+    df = pd.read_html(StringIO(str(table)))[0]
+
+    # 處理 MultiIndex：攤平為單層
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(-1)
+
+    # 提升第一列為欄位名稱
+    df.columns = df.iloc[0]
+    df = df.iloc[1:].reset_index(drop=True).dropna(how='all')
+
+    # 去除最後一列若為「顏色識別」說明列
+    if not df.empty:
+        last_row_str = ' '.join(str(v) for v in df.iloc[-1].values)
+        if '顏色識別' in last_row_str:
+            df = df.iloc[:-1]
+
+    # 正規化欄位名稱：強制轉 str 再去空白，避免 float NaN 欄位名稱導致崩潰
+    df.columns = [str(c).strip().replace(' ', '').replace('\xa0', '') for c in df.columns]
+
+    # 用名稱關鍵字找目標欄位（取代硬編碼 iloc[:, [2, 7]]）
+    date_col = next((c for c in df.columns if '日期' in c), None)
+    pct_col = next((c for c in df.columns if '持有' in c and ('%' in c or '百分比' in c)), None)
+    if pct_col is None:
+        pct_col = next((c for c in df.columns if '%' in c and c != date_col), None)
+    if date_col is None or pct_col is None:
+        raise ValueError(
+            f"股票 {stock_code} 持股表格欄位結構異常，找不到日期欄（{date_col}）或持有百分比欄（{pct_col}）。"
+            f"現有欄位：{df.columns.tolist()}")
+
+    df = df[[date_col, pct_col]].reset_index(drop=True)
+    df.columns = ['資料日期', HOLDERS_PCT_COL]
+    df['資料日期'] = pd.to_datetime(df['資料日期'], format='%Y%m%d', errors='coerce')
+    df[HOLDERS_PCT_COL] = pd.to_numeric(df[HOLDERS_PCT_COL], errors='coerce')
+    df = df.dropna()
+    if df.empty:
+        raise ValueError(f"股票 {stock_code} 清理後無有效的大戶持股資料。")
+    return df.sort_values('資料日期', ascending=False).reset_index(drop=True)
+
+
 def plot_stock_major_shareholders(stock_identifier):
     """
-    【重大修改】動態爬取大戶持股資料並用 Plotly 繪製圖表。
+    動態爬取大戶持股資料並用 Plotly 繪製圖表（近 12 週）。
     返回 (figure, error_message)
     """
     try:
@@ -44,77 +103,24 @@ def plot_stock_major_shareholders(stock_identifier):
     except KeyError:
         return None, f"錯誤: 在 twstock 資料庫中找不到股票 '{stock_identifier}'"
 
-    url = f'https://norway.twsthr.info/StockHolders.aspx?stock={stock_code}'
-    headers = {'User-Agent': 'Mozilla/5.0'}
-
     try:
         print(f"正在從網路抓取股票 {stock_code} 的大戶持股資料...")
-        res = requests.get(url, headers=headers, timeout=20)
-        res.raise_for_status()
-        res.encoding = 'utf-8'
-
-        soup = BeautifulSoup(res.text, 'lxml')
-        table = soup.select_one('#Details')
-        if not table:
-            return None, f"錯誤：在股票 {stock_code} 的資料頁面中找不到持股資料表。"
-
-        # 資料清理
-        df = pd.read_html(StringIO(str(table)))[0]
-
-        # 處理 MultiIndex：攤平為單層
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(-1)
-
-        # 提升第一列為欄位名稱
-        df.columns = df.iloc[0]
-        df = df.iloc[1:].reset_index(drop=True).dropna(how='all')
-
-        # 去除最後一列若為「顏色識別」說明列
-        if not df.empty:
-            last_row_str = ' '.join(str(v) for v in df.iloc[-1].values)
-            if '顏色識別' in last_row_str:
-                df = df.iloc[:-1]
-
-        # 正規化欄位名稱：強制轉 str 再去空白，避免 float NaN 欄位名稱導致崩潰
-        # 對 float 做 'xxx' in col 會觸發 "argument of type 'float' is not iterable"
-        df.columns = [str(c).strip().replace(' ', '').replace(' ', '') for c in df.columns]
-
-        # 用名稱關鍵字找目標欄位（取代硬編碼 iloc[:, [2, 7]]）
-        date_col = next((c for c in df.columns if '日期' in c), None)
-        pct_col  = next((c for c in df.columns if '持有' in c and ('%' in c or '百分比' in c)), None)
-        if pct_col is None:
-            pct_col = next((c for c in df.columns if '%' in c and c != date_col), None)
-
-        if date_col is None or pct_col is None:
-            return None, (
-                f"錯誤：股票 {stock_code} 持股表格欄位結構異常，"
-                f"找不到日期欄（{date_col}）或持有百分比欄（{pct_col}）。"
-                f"現有欄位：{df.columns.tolist()}"
-            )
-
-        df = df[[date_col, pct_col]].reset_index(drop=True)
-        df.columns = ['資料日期', '>400張大股東持有百分比']
-        df['資料日期'] = pd.to_datetime(df['資料日期'], format='%Y%m%d', errors='coerce')
-        df['>400張大股東持有百分比'] = pd.to_numeric(df['>400張大股東持有百分比'], errors='coerce')
-        df.dropna(inplace=True)
-        
-        if df.empty:
-            return None, f"錯誤：股票 {stock_code} 清理後無有效的大戶持股資料。"
+        df = fetch_major_holders(stock_code)
 
         # 繪製圖表 (近12週)
         df_plot = df.head(12).iloc[::-1].reset_index(drop=True)
-        
+
         fig = go.Figure()
         fig.add_trace(go.Scatter(
-            x=df_plot['資料日期'], 
-            y=df_plot['>400張大股東持有百分比'],
+            x=df_plot['資料日期'],
+            y=df_plot[HOLDERS_PCT_COL],
             mode='lines+markers+text',
             name='大戶持股比例',
             line_shape='hv', # 階梯線
-            text=[f'{v:.2f}%' for v in df_plot['>400張大股東持有百分比']],
+            text=[f'{v:.2f}%' for v in df_plot[HOLDERS_PCT_COL]],
             textposition="top center"
         ))
-        
+
         fig.update_layout(
             title=f"{stock_name} ({stock_code}) 大戶股權變化圖 (持股>400張，近12週)",
             xaxis_title='日期 (週為單位)',
@@ -124,8 +130,10 @@ def plot_stock_major_shareholders(stock_identifier):
         print(f"大戶持股圖表物件已成功生成: {stock_code}")
         return fig, None
 
-    except requests.exceptions.RequestException as e:
-        return None, f"錯誤：抓取股票 {stock_code} 大戶持股資料時發生網路錯誤: {e}"
+    except ScrapeError as e:
+        return None, f"錯誤：抓取股票 {stock_code} 大戶持股資料失敗：{e}"
+    except ValueError as e:
+        return None, f"錯誤：{e}"
     except Exception as e:
         return None, f"錯誤：處理股票 {stock_code} 大戶持股資料時發生未預期錯誤: {e}"
 
@@ -187,4 +195,4 @@ def plot_stock_revenue_trend(stock_identifier):
     except finmind_client.FinMindError as e:
         return None, f"錯誤: {e}"
     except Exception as e:
-        return None, f"錯誤: 處理營收資料時發生未預期錯誤: {e}"
+        return None, f"錯誤: 處理營收資料時發生未預期錯誤: {e}"

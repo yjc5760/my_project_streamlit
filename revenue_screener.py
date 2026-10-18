@@ -26,7 +26,6 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from functools import lru_cache
 from datetime import date, timedelta
 from typing import Callable
 
@@ -35,6 +34,7 @@ import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 
+from scrape_utils import memoize_ttl
 from local_screener import (UA, ScreenerError, _COMMON_STOCK, _to_date,
                             fetch_tpex_day, fetch_twse_day)
 
@@ -122,7 +122,23 @@ def _fetch_mops_file(path: str, problems: list) -> pd.DataFrame | None:
     return None
 
 
-@lru_cache(maxsize=128)
+def _mops_ttl(args, result) -> int:
+    """
+    彙總表的快取期限：公司陸續公告到隔月 10 日，期間檔案每天在變。
+    - 還沒有資料（尚未公告）：30 分鐘
+    - 最近兩個月（可能還在增加）：1 小時
+    - 更早的月份（已定案）：7 天
+    取代原本的 lru_cache——它永不過期，長時間執行的程式會一直用月初抓到的不完整資料。
+    """
+    year, month = args
+    if result is None or result.empty:
+        return 1800
+    today = date.today()
+    age = (today.year * 12 + today.month) - (year * 12 + month)
+    return 3600 if age <= 2 else 7 * 86400
+
+
+@memoize_ttl(_mops_ttl, maxsize=256)
 def fetch_mops_month(year: int, month: int) -> pd.DataFrame:
     """
     抓某年月的上市＋上櫃營收彙總（國內 _0 ＋ KY _1；較早年份沒有分檔時改抓無後綴檔名）。

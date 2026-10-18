@@ -19,8 +19,10 @@ import pandas as pd
 
 from concentration_1day import filter_stock_data
 from local_screener import Screen103Params, ScreenerError, screen_103
+from quality_screener import QualityParams, fetch_ocf_ytd, screen_quality
 from revenue_screener import RevenueParams, screen_revenue
 from scrape_utils import ScrapeError, lkg_load, lkg_save
+from stock_information_plot import fetch_major_holders
 
 AnalyzeFn = Callable[[str], dict]
 ProgressFn = Callable[[int, int, str], None]
@@ -191,3 +193,12 @@ def run_screen_revenue(params: dict) -> dict:
         'universe_size': res.universe_size, 'n_candidates': n_cand,
         'errors': res.errors, 'notes': res.notes,
     }
+
+
+def run_screen_quality(rev_matches: pd.DataFrame, params: dict, price_fn) -> dict:
+    """
+    四條件選股（月營收選股結果再加篩）。price_fn(code) 由呼叫端注入（各自的日線快取）；
+    大戶週資料用 fetch_major_holders、現金流量表用 FinMind。
+    """
+    res = screen_quality(rev_matches, price_fn, fetch_major_holders, fetch_ocf_ytd, QualityParams(**params))
+    return {'matches': res.matches, 'detail': res.detail, 'funnel': res.funnel, 'errors': res.errors}

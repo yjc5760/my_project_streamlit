@@ -19,8 +19,6 @@ sys.stdout = sys.stderr
 import json
 import os
 import re
-import threading
-import time
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -55,12 +53,16 @@ from mcp.server.fastmcp import FastMCP
 import services
 from local_screener import Screen103Params
 from revenue_screener import RevenueParams
+from quality_screener import QualityParams
+from drawdown_backtest import DEFAULT_THRESHOLDS, run_drawdown_backtest
+from financial_snapshot import run_financial_snapshot
+from earnings_materials import get_materials
 from yahoo_scraper import scrape_yahoo_stock_rankings
 from stock_analyzer import analyze_stock, build_chart, fetch_price_history, AnalysisError
 from stock_information_plot import (plot_stock_revenue_trend, plot_stock_major_shareholders,
                                     get_stock_code)
 from concentration_1day import fetch_stock_concentration_data
-from scrape_utils import lkg_key
+from scrape_utils import lkg_key, memoize_ttl
 
 mcp = FastMCP(
     "tw-stock-analyzer",
@@ -75,9 +77,6 @@ mcp = FastMCP(
 # ──────────────────────────────────────────────────────────────────────────────
 # 共用輔助
 # ──────────────────────────────────────────────────────────────────────────────
-_PRICE_TTL = 3600
-_price_cache: dict[str, tuple[float, pd.DataFrame]] = {}
-_cache_lock = threading.Lock()
 
 
 def _records(df: pd.DataFrame | None) -> list[dict]:
@@ -95,17 +94,13 @@ def _num(v, nd: int = 2):
     return None if f != f else round(f, nd)
 
 
+@memoize_ttl(3600, maxsize=300)
 def _price_history(code: str) -> pd.DataFrame:
-    """日線加 1 小時記憶體快取（只快取成功結果）；指標與圖表都從它現算，降低 FinMind 用量。"""
-    now = time.time()
-    with _cache_lock:
-        hit = _price_cache.get(code)
-        if hit and now - hit[0] < _PRICE_TTL:
-            return hit[1]
-    df = fetch_price_history(code)
-    with _cache_lock:
-        _price_cache[code] = (now, df)
-    return df
+    """
+    日線加 1 小時記憶體快取（只快取成功結果，最多 300 檔、淘汰最久沒用的）；
+    指標與圖表都從它現算，降低 FinMind 用量。
+    """
+    return fetch_price_history(code)
 
 
 def _analyze(code: str, price_data: pd.DataFrame | None = None) -> dict:
@@ -400,6 +395,187 @@ async def stock_analysis(stock: str, save_charts: bool = True) -> dict:
         save_charts: 是否把三張圖存成 HTML 到專案的 mcp_output/ 資料夾，並回傳檔案路徑。
     """
     return await _in_thread(_single, stock, save_charts)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 工具 7：四條件選股（月營收選股再加篩）
+# ──────────────────────────────────────────────────────────────────────────────
+def _run_quality(rev_params: dict, q_params: dict, include_rejected: bool) -> dict:
+    rev, stale = _with_lkg(lkg_key("screen_revenue", rev_params), services.run_screen_revenue, rev_params)
+    res = services.run_screen_quality(rev["matches"], q_params, _price_history)
+    out = {
+        "queried_at": _now(),
+        "criteria": [
+            f"母體：月營收選股（今年每月營收高於前 {rev_params['lookback_years']} 年同月、年增率 > {rev_params['yoy_min']}%）",
+            f"② 營收 YoY 持續成長不減速：最近 {q_params['accel_months']} 個月年增率皆 > 0 且逐月不下降",
+            "③ 均線：MA5 > MA20 且 MA10 > MA20",
+            f"① 大戶（>400 張）持續增加：近 {q_params['holder_weeks']} 週至少 {q_params['holder_min_up']} 週增加、"
+            "累計為正、最新一週不減少" + ("；且 8 週前 < 4 週前 < 最新" if q_params["holder_strict"] else ""),
+            f"④ 營業現金流：近四季合計（TTM）連續 {q_params['ocf_quarters']} 季上升且 > 0",
+        ],
+        "params": {**rev_params, **q_params},
+        "funnel": res["funnel"],
+        "count": len(res["matches"]),
+        "stocks": res["matches"],
+        "fetch_errors": res["errors"],
+        "revenue_notes": rev["notes"],
+        "stale": stale,
+    }
+    if include_rejected:      # 只列過了 ② 的（近乎過關的才有參考價值），避免回傳上百檔
+        out["rejected_after_revenue"] = [d for d in res["detail"]
+                                         if d["未通過"] and not d["未通過"].startswith("②")]
+    return out
+
+
+@mcp.tool()
+async def quality_pick(
+    lookback_years: int = 4,
+    yoy_min: float = 0.0,
+    per_company_month: bool = True,
+    accel_months: int = 3,
+    holder_weeks: int = 4,
+    holder_min_up: int = 3,
+    holder_strict: bool = False,
+    ocf_quarters: int = 3,
+    min_volume_lots: float = 0,
+    include_rejected: bool = True,
+) -> dict:
+    """四條件選股：先跑月營收選股，再依序篩 ② 營收 YoY 不減速 → ③ 均線多頭 → ① 大戶持續增加 → ④ 營業現金流 TTM 上升。
+
+    逐關篩選，沒過前一關就不抓後面的資料；回傳各關通過檔數（funnel）與每檔卡在哪一關。
+    大戶資料來自集保週資料（norway.twsthr.info），現金流量表來自 FinMind（最新為已公告的季報）。約需 1～3 分鐘。
+
+    Args:
+        lookback_years: 月營收母體：每月營收須高於過去幾年同月最高值。
+        yoy_min: 月營收母體：每月年增率下限（%）。
+        per_company_month: True＝各公司用自己最新公告月份（月初建議 True，避免未公告者被排除）。
+        accel_months: ② 檢查最近幾個月的年增率逐月不下降。
+        holder_weeks: ① 觀察最近幾週的大戶持股比例。
+        holder_min_up: ① 其中至少幾週增加。
+        holder_strict: ① 是否另要求 8 週前 < 4 週前 < 最新（較嚴格）。
+        ocf_quarters: ④ 近四季合計營業現金流須連續上升幾季。
+        min_volume_lots: 成交張數下限（0＝不限）。
+        include_rejected: 是否列出過了 ② 但在後面關卡被刷掉的股票與原因。
+    """
+    rev_params = asdict(RevenueParams(yoy_min=float(yoy_min), lookback_years=int(lookback_years),
+                                      per_company_month=per_company_month))
+    q_params = asdict(QualityParams(accel_months=int(accel_months), holder_weeks=int(holder_weeks),
+                                    holder_min_up=int(holder_min_up), holder_strict=holder_strict,
+                                    ocf_quarters=int(ocf_quarters), min_volume_lots=float(min_volume_lots)))
+    return await _in_thread(_run_quality, rev_params, q_params, include_rejected)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 工具 8：回檔門檻回測
+# ──────────────────────────────────────────────────────────────────────────────
+def _drawdown(stock: str, years: int, thresholds: list[float], lookback: int, horizon: int,
+              include_events: bool) -> dict:
+    code = get_stock_code(stock)
+    if not code:
+        raise ValueError(f"找不到股票「{stock}」，請輸入代碼（如 2330）或名稱（如 台積電）")
+    info = twstock.codes.get(code)
+    res = run_drawdown_backtest(code, years, tuple(sorted(set(thresholds))), lookback, horizon)
+    if not include_events:
+        res.pop("events")
+    return {
+        "queried_at": _now(), "code": code, "name": info.name if info else code,
+        "method": (f"還原股價（自行還原除權息、面額變更、減資）；收盤價自 {lookback} 日高點回檔達門檻時買進、持有 {horizon} 個交易日；"
+                   f"同一波下跌只算第一次觸發（再創 {lookback} 日新高才重新計算）；"
+                   f"基準＝回測期間每天買進持有 {horizon} 日的報酬分佈。未滿期的觸發不列入統計。"),
+        **res,
+    }
+
+
+@mcp.tool()
+async def drawdown_backtest(
+    stock: str,
+    years: int = 10,
+    thresholds: list[float] | None = None,
+    lookback: int = 60,
+    horizon: int = 60,
+    include_events: bool = True,
+) -> dict:
+    """回檔門檻回測：股價自 N 日高點回檔 X% 時買進、持有 H 個交易日的歷史勝率、報酬中位數、最差報酬與期間最大浮虧，並和「任選一天買進」的基準比較。
+
+    使用還原股價（避免除權息跳空被誤判成回檔）。current 欄位顯示目前距高點幾 %、已達哪些門檻。
+
+    Args:
+        stock: 股票代碼或名稱，例如 "2330" 或 "台積電"。
+        years: 回測年數（預設 10 年）。
+        thresholds: 回檔門檻（%），預設 [10, 15, 20, 25]。
+        lookback: 高點的觀察天數（交易日，預設 60）。
+        horizon: 觸發後持有天數（交易日，預設 60）。
+        include_events: 是否列出每一次觸發的明細。
+    """
+    return await _in_thread(_drawdown, stock, years, list(thresholds or DEFAULT_THRESHOLDS),
+                            lookback, horizon, include_events)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 工具 9：季報指標表
+# ──────────────────────────────────────────────────────────────────────────────
+def _fin_snapshot(stock: str, quarters: int) -> dict:
+    code = get_stock_code(stock)
+    if not code:
+        raise ValueError(f"找不到股票「{stock}」，請輸入代碼（如 2330）或名稱（如 台積電）")
+    info = twstock.codes.get(code)
+    return {"queried_at": _now(), "code": code, "name": info.name if info else code,
+            "source": "FinMind TaiwanStockFinancialStatements（綜合損益表，單季）、"
+                      "TaiwanStockCashFlowsStatement（現金流量表，累計換算單季）",
+            **run_financial_snapshot(code, quarters)}
+
+
+@mcp.tool()
+async def financial_snapshot(stock: str, quarters: int = 8) -> dict:
+    """季報指標表：最新一季的營收、毛利率、營益率、淨利率、EPS，以及和上一季（QoQ）、去年同季（YoY）的比較；附近 N 季趨勢。
+
+    另做兩個獲利品質檢查：業外收支占稅前淨利比、近四季營業現金流 ÷ 稅後淨利（現金轉換率），
+    超過門檻時列在 flags（只陳述數字，不下好壞結論）。
+    數字皆來自已公告的季報（FinMind）；業績指引與法說會語氣不在資料中，需另外提供法說會簡報或逐字稿。
+
+    Args:
+        stock: 股票代碼或名稱，例如 "2330" 或 "台積電"。
+        quarters: 趨勢表列出最近幾季（預設 8）。
+    """
+    return await _in_thread(_fin_snapshot, stock, quarters)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 工具 10：法說會簡報（公開資訊觀測站）
+# ──────────────────────────────────────────────────────────────────────────────
+def _earnings(stock: str, n_download: int, years: int, extract_text: bool, debug: bool,
+              include_sessions: bool) -> dict:
+    code = get_stock_code(stock)
+    if not code:
+        raise ValueError(f"找不到股票「{stock}」，請輸入代碼（如 2330）或名稱（如 台積電）")
+    info = twstock.codes.get(code)
+    return {"queried_at": _now(), "code": code, "name": info.name if info else code,
+            "source": "公開資訊觀測站 法人說明會一覽表（t100sb02_1）",
+            **get_materials(code, OUT_DIR, n_download, years, extract_text, debug, include_sessions)}
+
+
+@mcp.tool()
+async def earnings_call_materials(stock: str, n_download: int = 2, years: int = 2,
+                                  extract_text: bool = True, debug: bool = False,
+                                  include_sessions: bool = False) -> dict:
+    """法說會簡報：查公開資訊觀測站上某公司近幾年的法說會，依簡報檔分組，下載最近 n 份不同的中文簡報 PDF 到 mcp_output/，並抽出文字。
+
+    公司通常每季只在自辦的財報說明會發表一份新簡報，之後的券商論壇都沿用，所以 decks 每一筆＝一份簡報：
+    首次發表日、發表場合、是否自辦、沿用場次、影音連結（證交所 irconference 或公司網站）。
+
+    用途：搭配 financial_snapshot 的數字，分析業績指引與前後兩次法說會的說法變化。
+    台灣多數公司只上傳簡報、沒有逐字稿；簡報以圖表為主時抽出的文字可能不完整，重要數字請對照 PDF。
+    抽文字需要 pypdf（pip install pypdf）；沒安裝時只回傳檔案路徑。
+
+    Args:
+        stock: 股票代碼或名稱，例如 "2330" 或 "台積電"。
+        n_download: 下載最近幾份不同的簡報（預設 2，方便比較前後兩季）。
+        years: 往回查幾年（預設 2）。
+        extract_text: 是否抽出 PDF 文字。
+        debug: 是否把公開資訊觀測站的原始回應存到 mcp_output/_mops_t100sb02_*.html（排查格式問題用）。
+        include_sessions: 是否列出每一場（含券商論壇）的日期、地點與擇要訊息。
+    """
+    return await _in_thread(_earnings, stock, n_download, years, extract_text, debug, include_sessions)
 
 
 # ──────────────────────────────────────────────────────────────────────────────

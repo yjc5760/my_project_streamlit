@@ -10,12 +10,15 @@
 """
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import os
 import pickle
 import re
+import threading
 import time
+from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -111,3 +114,76 @@ def lkg_load(key: str):
     except Exception as e:                          # noqa: BLE001
         print(f"[lkg] 無法讀取 {key}: {e}")
         return None
+
+
+# ---------------------------------------------------------------------------
+# 有期限的快取（失敗不快取：函式 raise 時什麼都不存）
+# ---------------------------------------------------------------------------
+def memoize_ttl(ttl, maxsize: int = 256):
+    """
+    記憶體快取。ttl 可以是秒數，或 ttl(args, result) -> 秒數（依參數／結果決定期限，例如空結果短一點）。
+    超過 maxsize 時淘汰最久沒用的。執行緒安全。提供 .cache_clear()。
+    """
+    def deco(fn):
+        store: OrderedDict = OrderedDict()
+        lock = threading.Lock()
+
+        @functools.wraps(fn)
+        def wrapper(*args):
+            now = time.time()
+            with lock:
+                hit = store.get(args)
+                if hit and hit[0] > now:
+                    store.move_to_end(args)
+                    return hit[1]
+            result = fn(*args)
+            sec = ttl(args, result) if callable(ttl) else ttl
+            if sec > 0:
+                with lock:
+                    store[args] = (now + sec, result)
+                    store.move_to_end(args)
+                    while len(store) > maxsize:
+                        store.popitem(last=False)
+            return result
+
+        def cache_clear():
+            with lock:
+                store.clear()
+        wrapper.cache_clear = cache_clear
+        return wrapper
+    return deco
+
+
+MEMO_DIR = Path(os.getenv("MEMO_DIR", LKG_DIR.parent / "memo"))
+
+
+def disk_memo(namespace: str, ttl_sec: int):
+    """
+    磁碟快取（.cache/memo/<namespace>/）：給季報、大戶週資料這類很少變動、又會耗 API 額度的資料。
+    程式重啟後仍有效；讀寫失敗時直接重抓，不影響主流程。設環境變數 DISABLE_DISK_MEMO=1 可關閉。
+    """
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(*args):
+            if os.getenv("DISABLE_DISK_MEMO"):
+                return fn(*args)
+            key = hashlib.md5(repr(args).encode()).hexdigest()[:16]
+            path = MEMO_DIR / namespace / f"{key}.pkl"
+            try:
+                if path.exists() and time.time() - path.stat().st_mtime < ttl_sec:
+                    with open(path, "rb") as f:
+                        return pickle.load(f)
+            except Exception as e:                  # noqa: BLE001
+                print(f"[memo] 讀取 {namespace}/{key} 失敗，改為重抓：{e}")
+            result = fn(*args)
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = path.with_suffix(".tmp")
+                with open(tmp, "wb") as f:
+                    pickle.dump(result, f)
+                tmp.replace(path)
+            except Exception as e:                  # noqa: BLE001
+                print(f"[memo] 無法儲存 {namespace}/{key}：{e}")
+            return result
+        return wrapper
+    return deco

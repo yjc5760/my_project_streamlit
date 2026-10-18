@@ -4,6 +4,7 @@ import streamlit as st
 import pandas as pd
 import os
 import re
+import time
 from dataclasses import asdict
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -17,6 +18,8 @@ from plotly.subplots import make_subplots
 try:
     from local_screener import Screen103Params, ScreenerError
     from revenue_screener import RevenueParams
+    from quality_screener import QualityParams
+    from financial_snapshot import run_financial_snapshot
     from yahoo_scraper import scrape_yahoo_stock_rankings
     from stock_analyzer import analyze_stock, build_chart, fetch_price_history, AnalysisError
     from market_calendar import is_trading_hours
@@ -52,9 +55,14 @@ except Exception:
 # --------------------------------------------------------------------------------
 # 改善 2：交易時間感知 TTL
 # --------------------------------------------------------------------------------
-def market_ttl(intraday_sec: int, offhours_sec: int = 3600) -> int:
-    """盤中使用 intraday_sec，盤後/假日使用 offhours_sec"""
-    return intraday_sec if is_trading_hours() else offhours_sec
+def time_bucket(intraday_sec: int, offhours_sec: int = 3600) -> str:
+    """
+    快取的時間區段鍵：每次呼叫時依「現在是否盤中」決定區段長度，區段一換，快取鍵就不同 → 重新抓取。
+    （不能直接寫 @st.cache_data(ttl=依盤中盤後計算)：decorator 的 ttl 只在程式載入時算一次，之後不會切換。）
+    """
+    trading = is_trading_hours()
+    sec = intraday_sec if trading else offhours_sec
+    return f"{'i' if trading else 'o'}{sec}-{int(time.time() // sec)}"
 
 # --------------------------------------------------------------------------------
 # 改善 4：Figure 快取改用 JSON 序列化，大幅降低記憶體佔用
@@ -111,23 +119,36 @@ def _batch_kd_analyze(
 # 失敗結果不快取：快取函式內遇到失敗一律 raise（st.cache_data 不會快取例外），
 # 外層包裝再轉回原本的 None / 錯誤 dict，讓既有的顯示邏輯不用改。
 # --------------------------------------------------------------------------------
-@st.cache_data(ttl=market_ttl(1800, 3600), show_spinner=False)   # 盤中30分鐘；盤後1小時
-def _cached_screen_103(params: dict) -> dict:
+# 快取期限由 time_bucket 參數控制（盤中／盤後區段長度不同）；decorator 的 ttl 只負責清掉過期的舊區段。
+@st.cache_data(ttl=3600, show_spinner=False)
+def _screen_103_by_bucket(params: dict, bucket: str) -> dict:
     """我的選股103（本機計算）。ScreenerError 直接往外拋，不會被快取。"""
     return services.run_screen_103(params)
 
-@st.cache_data(ttl=market_ttl(1800, 21600), show_spinner=False)  # 盤中30分鐘；盤後6小時
-def _cached_screen_revenue(params: dict) -> dict:
+def _cached_screen_103(params: dict) -> dict:
+    return _screen_103_by_bucket(params, time_bucket(1800, 3600))       # 盤中30分鐘；盤後1小時
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def _screen_revenue_by_bucket(params: dict, bucket: str) -> dict:
     """月營收選股（本機計算）。ScreenerError 直接往外拋，不會被快取。"""
     return services.run_screen_revenue(params)
 
-@st.cache_data(ttl=market_ttl(300, 3600))   # 盤中5分鐘；盤後1小時
-def _cached_fetch_concentration_data():
+def _cached_screen_revenue(params: dict) -> dict:
+    return _screen_revenue_by_bucket(params, time_bucket(1800, 21600))  # 盤中30分鐘；盤後6小時
+
+@st.cache_data(ttl=3600)
+def _concentration_by_bucket(bucket: str):
     return fetch_stock_concentration_data()          # ScrapeError 往外拋，不進快取
 
-@st.cache_data(ttl=market_ttl(60, 300))     # 盤中1分鐘；盤後5分鐘
-def _cached_scrape_yahoo_rankings(url):
+def _cached_fetch_concentration_data():
+    return _concentration_by_bucket(time_bucket(300, 3600))             # 盤中5分鐘；盤後1小時
+
+@st.cache_data(ttl=300)
+def _yahoo_rankings_by_bucket(url, bucket: str):
     return scrape_yahoo_stock_rankings(url)          # ScrapeError 往外拋，不進快取
+
+def _cached_scrape_yahoo_rankings(url):
+    return _yahoo_rankings_by_bucket(url, time_bucket(60, 300))          # 盤中1分鐘；盤後5分鐘
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def _cached_price_history(stock_id: str) -> pd.DataFrame:
@@ -196,15 +217,54 @@ def cached_analyze_stock(stock_id: str, price_data: pd.DataFrame | None = None) 
     res.pop('price_data', None)
     return res
 
-@st.cache_data(ttl=86400)
-def cached_plot_revenue(stock_id: str):
-    fig, err = plot_stock_revenue_trend(stock_id)
-    return _fig_to_cache(fig), err
+class _PlotFailed(Exception):
+    """快取函式內失敗時拋出，讓 st.cache_data 不快取失敗結果。"""
+
 
 @st.cache_data(ttl=86400)
-def cached_plot_shareholders(stock_id: str):
+def _plot_revenue_json(stock_id: str) -> str:
+    fig, err = plot_stock_revenue_trend(stock_id)
+    if fig is None or err:
+        raise _PlotFailed(err or "月營收圖產生失敗")
+    return _fig_to_cache(fig)
+
+@st.cache_data(ttl=43200)                            # 大戶週資料：12 小時
+def _plot_shareholders_json(stock_id: str) -> str:
     fig, err = plot_stock_major_shareholders(stock_id)
-    return _fig_to_cache(fig), err
+    if fig is None or err:
+        raise _PlotFailed(err or "大戶持股圖產生失敗")
+    return _fig_to_cache(fig)
+
+def cached_plot_revenue(stock_id: str):
+    """回傳 (圖表 JSON, 錯誤訊息)；失敗不進快取，下次會重試。"""
+    try:
+        return _plot_revenue_json(stock_id), None
+    except _PlotFailed as e:
+        return None, str(e)
+
+def cached_plot_shareholders(stock_id: str):
+    try:
+        return _plot_shareholders_json(stock_id), None
+    except _PlotFailed as e:
+        return None, str(e)
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def _quality_by_bucket(rev_params: dict, q_params: dict, bucket: str) -> dict:
+    """四條件選股：月營收母體（沿用月營收選股的快取）→ ②③①④ 逐關篩。失敗直接拋出，不進快取。"""
+    rev = _cached_screen_revenue(rev_params)
+    res = services.run_screen_quality(rev["matches"], q_params, _cached_price_history)
+    res["revenue_notes"] = rev.get("notes", [])
+    res["months_loaded"] = rev.get("months_loaded", [])
+    return res
+
+def cached_screen_quality(rev_params: dict, q_params: dict) -> dict:
+    return _quality_by_bucket(rev_params, q_params, time_bucket(1800, 21600))   # 盤中30分鐘；盤後6小時
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_financial_snapshot(stock_id: str) -> dict:
+    """季報指標（底層已有 1 天磁碟快取）；FinMind 失敗時拋出，不進快取。"""
+    return run_financial_snapshot(stock_id)
 
 # --------------------------------------------------------------------------------
 # 輔助函式
@@ -1093,7 +1153,7 @@ def display_single_stock_analysis(stock_identifier: str):
         stock_name = stock_info.name if stock_info else stock_code
         st.subheader(f"{stock_name} ({stock_code})")
         
-        tab1, tab2, tab3 = st.tabs(["技術分析", "月營收趨勢", "大戶股權變化"])
+        tab1, tab2, tab3, tab4 = st.tabs(["技術分析", "月營收趨勢", "大戶股權變化", "季報指標"])
         with tab1:
             render_stock_chart(stock_code, stock_name, key=f"tech_{stock_code}")
         with tab2:
@@ -1110,6 +1170,126 @@ def display_single_stock_analysis(stock_identifier: str):
                     st.plotly_chart(_fig_from_cache(shareholder_json), width="stretch", key=f"holders_{stock_code}")
                 else:
                     st.error(f"無法生成大戶股權圖: {shareholder_error}")
+        with tab4:
+            render_financial_snapshot(stock_code)
+
+def _fmt_seq(seq, unit="") -> str:
+    return " → ".join(f"{v:g}{unit}" for v in seq) if seq else ""
+
+
+def _quality_row(d: dict) -> dict:
+    """quality_screener 的逐檔結果（巢狀 dict）→ 表格一列。"""
+    ma, hd, oc = d.get("③均線") or {}, d.get("①大戶") or {}, d.get("④營現流") or {}
+    ttm = list((oc.get("TTM營業現金流(億)") or {}).values())
+    return {
+        "代碼": d["代碼"], "名稱": d["名稱"], "營收月份": d.get("營收月份"),
+        "營收YoY(舊→新,%)": _fmt_seq(d.get("②營收YoY(舊→新)")),
+        "收盤": ma.get("收盤"), "MA5": ma.get("MA5"), "MA10": ma.get("MA10"), "MA20": ma.get("MA20"),
+        "大戶持股(%)": hd.get("最新(%)"), "大戶4週增減": hd.get("4週增減"), "大戶8週增減": hd.get("8週增減"),
+        "大戶週增減(舊→新)": _fmt_seq(hd.get("週增減(舊→新)")),
+        "TTM營現流(億,舊→新)": _fmt_seq(ttm),
+        "未通過": d.get("未通過") or "",
+    }
+
+
+def display_quality_results():
+    st.header("🧪 四條件選股（月營收 → 營收加速 → 均線 → 大戶 → 營業現金流）")
+    rev_params = st.session_state.get('params_quality_rev', asdict(RevenueParams(per_company_month=True)))
+    q_params = st.session_state.get('params_quality', asdict(QualityParams()))
+    try:
+        with st.spinner("正在跑月營收母體，再逐關抓日線、大戶週資料與現金流量表（約 1～3 分鐘）..."):
+            res = cached_screen_quality(rev_params, q_params)
+    except (ScreenerError, ScrapeError) as e:
+        st.error(f"❌ 四條件選股失敗：{e}")
+        st.caption("失敗結果不會被快取，稍後重新按一次按鈕即可重試。")
+        return
+
+    st.info(f"""
+**條件**（依成本由低到高逐關篩選，沒過前一關就不抓後面的資料）
+- 母體：月營收選股（今年每月營收高於前 {rev_params['lookback_years']} 年同月、年增率 > {rev_params['yoy_min']}%；{'各公司最新公告月份' if rev_params.get('per_company_month') else '全市場最新公告月份'}）
+- ② 營收 YoY 不減速：最近 {q_params['accel_months']} 個月年增率皆 > 0 且逐月不下降
+- ③ 均線：MA5 > MA20 且 MA10 > MA20
+- ① 大戶（>400 張）持續增加：近 {q_params['holder_weeks']} 週至少 {q_params['holder_min_up']} 週增加、累計為正、最新一週不減少{'；且 8 週前 < 4 週前 < 最新' if q_params['holder_strict'] else ''}
+- ④ 營業現金流：近四季合計（TTM）連續 {q_params['ocf_quarters']} 季上升且 > 0
+""")
+    for note in res.get("revenue_notes", []):
+        st.caption(f"ℹ️ {note}")
+
+    funnel = res["funnel"]
+    fig = go.Figure(go.Funnel(y=list(funnel.keys()), x=list(funnel.values()), textinfo="value",
+                              marker={"color": SERIES[0]}, connector={"line": {"color": "#d0cec8"}}))
+    fig.update_layout(height=300, margin=dict(l=10, r=10, t=10, b=10))
+    st.plotly_chart(fig, width="stretch", key="quality_funnel")
+
+    if res["errors"]:
+        with st.expander(f"⚠️ {len(res['errors'])} 檔抓資料失敗（列為未通過）"):
+            st.dataframe(pd.DataFrame(res["errors"]), hide_index=True)
+
+    if res["matches"]:
+        st.success(f"共 {len(res['matches'])} 檔通過全部條件")
+        df = pd.DataFrame([_quality_row(d) for d in res["matches"]]).drop(columns=["未通過"])
+        st.dataframe(df, hide_index=True)
+        render_chart_picker([(r["代碼"], r["名稱"]) for r in res["matches"]], key="quality")
+    else:
+        st.warning("目前沒有通過全部條件的股票。")
+
+    rejected = [d for d in res["detail"] if d.get("未通過") and not d["未通過"].startswith("②")]
+    if rejected:
+        with st.expander(f"過了「營收加速」、但在後面關卡被刷掉的 {len(rejected)} 檔（近乎過關，可留意）"):
+            rdf = pd.DataFrame([_quality_row(d) for d in rejected])
+            st.dataframe(rdf[["代碼", "名稱", "未通過"] + [c for c in rdf.columns if c not in ("代碼", "名稱", "未通過")]],
+                         hide_index=True)
+
+
+def _metric_delta(v, unit):
+    return None if v is None else f"{v:+.2f}{unit}"
+
+
+def render_financial_snapshot(stock_code: str):
+    try:
+        with st.spinner("正在讀取季報（FinMind）..."):
+            snap = cached_financial_snapshot(stock_code)
+    except Exception as e:                      # noqa: BLE001  FinMindError／資料缺漏
+        st.error(f"無法取得季報資料：{e}")
+        return
+    m = snap["本季指標"]
+    st.caption(f"最新季度 {snap['最新季度']}；QoQ 比 {snap['比較基準']['QoQ']}、YoY 比 {snap['比較基準']['YoY']}"
+               "；資料來源：FinMind 綜合損益表（單季）、現金流量表")
+    c = st.columns(5)
+    c[0].metric("營收（億）", m["營收"]["本季(億)"], _metric_delta(m["營收"]["YoY(%)"], "% YoY"))
+    c[1].metric("毛利率", f"{m['毛利率']['本季(%)']}%", _metric_delta(m["毛利率"]["YoY(百分點)"], " 百分點 YoY"))
+    c[2].metric("營益率", f"{m['營益率']['本季(%)']}%", _metric_delta(m["營益率"]["YoY(百分點)"], " 百分點 YoY"))
+    c[3].metric("EPS（元）", m["EPS"]["本季(元)"], _metric_delta(m["EPS"]["YoY(%)"], "% YoY"))
+    c[4].metric("業外占稅前淨利", f"{m['業外占稅前淨利']['本季(%)']}%")
+
+    for f in snap["flags"]:
+        st.warning(f"⚠️ {f}")
+    for n in snap.get("基期說明", []):
+        st.caption(f"ℹ️ {n}")
+    for n in snap.get("notes", []):
+        st.caption(f"ℹ️ {n}")
+
+    tr = pd.DataFrame(snap["近期季度"])
+    if not tr.empty:
+        fig = make_subplots(specs=[[{"secondary_y": True}]])
+        fig.add_bar(x=tr["季度"], y=tr["營收(億)"], name="營收（億）", marker_color="#c9c6bd", secondary_y=False)
+        for col, color in (("毛利率(%)", SERIES[0]), ("營益率(%)", SERIES[1]), ("淨利率(%)", SERIES[2])):
+            fig.add_scatter(x=tr["季度"], y=tr[col], name=col, mode="lines+markers",
+                            line=dict(color=color, width=2), secondary_y=True)
+        fig.update_yaxes(title_text="營收（億）", secondary_y=False)
+        fig.update_yaxes(title_text="比率（%）", secondary_y=True)
+        fig.update_layout(height=380, margin=dict(l=10, r=10, t=30, b=10), hovermode="x unified")
+        legend_top(fig)
+        st.plotly_chart(fig, width="stretch", key=f"fin_{stock_code}")
+        st.dataframe(tr, hide_index=True)
+
+    cash = snap.get("現金轉換")
+    if cash and "現金轉換率(倍)" in cash:
+        st.caption(f"現金轉換（{cash['區間']}）：營業現金流 {cash['營業現金流(億)']} 億 ÷ 稅後淨利 "
+                   f"{cash['稅後淨利(億)']} 億 ＝ **{cash['現金轉換率(倍)']} 倍**")
+    elif cash:
+        st.caption(cash.get("說明", ""))
+
 
 # --- 主程式進入點 ---
 def main():
@@ -1159,6 +1339,24 @@ def main():
         prev_yoy = st.slider("每月年增率須大於（%）", 0, 50, int(_r.yoy_min), step=5, key="prev_yoy")
         prev_pc = st.checkbox("各公司以自己最新公告月份為當月", value=False, key="prev_pc",
                               help="不勾選＝全市場統一以最新有公告的月份為當月，還沒公告的公司不入選")
+    with st.sidebar.expander("四條件選股條件", expanded=False):
+        _q = QualityParams()
+        q_pc = st.checkbox("月營收母體：各公司以自己最新公告月份為當月", value=True, key="q_pc",
+                           help="月初很多公司還沒公告上個月營收，建議勾選，避免被排除（年數、年增率沿用「月營收選股條件」）")
+        q_accel = st.slider("② 營收年增率逐月不下降：檢查最近幾個月", 2, 6, _q.accel_months, key="q_accel")
+        q_hw = st.slider("① 大戶：觀察最近幾週", 3, 8, _q.holder_weeks, key="q_hw")
+        q_hup = st.slider("① 大戶：其中至少幾週增加", 1, 8, _q.holder_min_up, key="q_hup",
+                          help="超過觀察週數時，會自動以觀察週數計算")
+        q_strict = st.checkbox("① 嚴格版：另要求 8 週前 < 4 週前 < 最新", value=_q.holder_strict, key="q_strict")
+        q_ocf = st.slider("④ 營業現金流 TTM 連續上升幾季", 1, 4, _q.ocf_quarters, key="q_ocf")
+        q_vol = st.number_input("成交張數下限（0＝不限）", value=0, step=500, key="q_vol")
+    st.session_state['params_quality_rev'] = asdict(RevenueParams(
+        yoy_min=float(prev_yoy), lookback_years=prev_years, per_company_month=q_pc,
+    ))
+    st.session_state['params_quality'] = asdict(QualityParams(
+        accel_months=q_accel, holder_weeks=q_hw, holder_min_up=min(q_hup, q_hw), holder_strict=q_strict,
+        ocf_quarters=q_ocf, min_volume_lots=float(q_vol),
+    ))
     st.session_state['params_rev'] = asdict(RevenueParams(
         yoy_min=float(prev_yoy), lookback_years=prev_years, per_company_month=prev_pc,
     ))
@@ -1184,6 +1382,8 @@ def main():
         st.session_state.action = "my_stock_picks"
     if st.sidebar.button("月營收選股（本機計算）"):
         st.session_state.action = "monthly_revenue_pick"
+    if st.sidebar.button("四條件選股（營收＋均線＋大戶＋現金流）"):
+        st.session_state.action = "quality_pick"
 
     st.sidebar.header("盤中即時排行")
     if st.sidebar.button("漲幅排行榜 (上市)"):
@@ -1209,6 +1409,8 @@ def main():
             display_my_103_results()
         elif action == "monthly_revenue_pick":
             display_monthly_revenue_results()
+        elif action == "quality_pick":
+            display_quality_results()
         elif action == "rank_listed":
             display_ranking_results("上市")
         elif action == "rank_otc":

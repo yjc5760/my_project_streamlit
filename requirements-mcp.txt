@@ -1,3 +1,4 @@
 # 只給本機 MCP Server 使用（Antigravity 連線用）；Streamlit Cloud 只讀 requirements.txt，不受影響
 -r requirements.txt
 mcp>=1.12,<2
+pypdf>=5          # earnings_call_materials 抽 PDF 文字用（選用）
