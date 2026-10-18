@@ -1,0 +1,27 @@
+# 換行統一規則：版控內一律存 LF，工作目錄依平台轉換（Windows 為 CRLF）。
+# 避免同一個檔案在不同電腦／工具編輯後，整個檔案都變成「已修改」。
+* text=auto
+
+*.py    text
+*.md    text
+*.txt   text
+*.toml  text
+*.json  text
+*.yml   text
+*.yaml  text
+*.cfg   text
+*.csv   text
+
+# Windows 批次檔維持 CRLF
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+
+# 二進位檔：不轉換、不做文字 diff
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.pdf   binary
+*.pkl   binary
+*.gz    binary
+*.xlsx  binary

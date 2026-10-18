@@ -126,4 +126,4 @@ if __name__ == '__main__':
         elif filtered_stocks is not None:
             print("\n沒有找到符合篩選條件的股票。")
         else:
-            print("\n篩選過程中發生錯誤。")
+            print("\n篩選過程中發生錯誤。")
