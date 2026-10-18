@@ -6,6 +6,11 @@
     .venv-mcp\\Scripts\\python backtest_103.py fetch     # 抓日線到 .cache/bt103/（需網路；可中斷、重跑會續抓）
     .venv-mcp\\Scripts\\python backtest_103.py run       # 離線回測，結果寫到 mcp_output/backtest_103/
 
+    # 改用 Yahoo Finance（快很多；需先 pip install yfinance）
+    .venv-mcp\\Scripts\\python backtest_103.py fetch --source yahoo   # 存到 .cache/bt103/prices_yahoo/
+    .venv-mcp\\Scripts\\python backtest_103.py compare                # 比對兩個來源重疊的股票
+    .venv-mcp\\Scripts\\python backtest_103.py run --source yahoo
+
 設計：
 - 訊號：第 t 天收盤後依 8 個條件選出；第 t+1 天開盤買進。開盤即漲停（≥ 昨收 × 1.095）視為買不到。
 - 報酬用還原價（除權息、面額變更、減資）計算；訊號本身用原始價（和實際選股時看到的一致）。
@@ -33,6 +38,7 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 CACHE = ROOT / ".cache" / "bt103"
 PRICES = CACHE / "prices"
+PRICES_YAHOO = CACHE / "prices_yahoo"
 DIVS = CACHE / "dividends"
 OUT = ROOT / "mcp_output" / "backtest_103"
 COST = 0.00585
@@ -133,14 +139,19 @@ COND_LABEL = {"c1_red_k": "1 紅K棒幅", "c2_volume": "2 成交張數", "c3_ma6
 # ──────────────────────────────────────────────────────────────────────────────
 # 資料
 # ──────────────────────────────────────────────────────────────────────────────
-def universe() -> list[str]:
+def universe_markets() -> dict[str, str]:
+    """{代碼: 上市／上櫃}（目前仍掛牌的普通股）。"""
     import twstock
-    return sorted(c for c, i in twstock.codes.items()
-                  if _COMMON.match(c) and i.type == "股票" and i.market in ("上市", "上櫃"))
+    return {c: i.market for c, i in sorted(twstock.codes.items())
+            if _COMMON.match(c) and i.type == "股票" and i.market in ("上市", "上櫃")}
 
 
-def load_prices(code: str) -> pd.DataFrame | None:
-    f = PRICES / f"{code}.csv.gz"
+def universe() -> list[str]:
+    return sorted(universe_markets())
+
+
+def load_prices(code: str, folder: Path | None = None) -> pd.DataFrame | None:
+    f = (folder or PRICES) / f"{code}.csv.gz"
     if not f.exists() or f.stat().st_size < 60:
         return None
     df = pd.read_csv(f, parse_dates=["date"]).set_index("date").sort_index()
@@ -222,6 +233,105 @@ def fetch_all(start: str, refresh_days: int = 5) -> None:
     print("完成。接著執行：python backtest_103.py run", flush=True)
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Yahoo Finance（yfinance）
+#   Close／Open／High／Low：已做分割調整、未做除息調整；Adj Close：分割＋除息都調整。
+#   代碼：上市 2330.TW、上櫃 6488.TWO。
+# ──────────────────────────────────────────────────────────────────────────────
+YAHOO_CHUNK = 80
+
+
+def _yahoo_frame(raw: pd.DataFrame, ticker: str) -> pd.DataFrame | None:
+    """yf.download(group_by='ticker') 的結果 → 單一股票的小寫欄位表。"""
+    if isinstance(raw.columns, pd.MultiIndex):
+        if ticker not in raw.columns.get_level_values(0):
+            return None
+        df = raw[ticker]
+    else:
+        df = raw
+    cols = {"Open": "open", "High": "high", "Low": "low", "Close": "close",
+            "Adj Close": "adj_close", "Volume": "volume"}
+    if not set(cols) <= set(df.columns):
+        return None
+    out = df[list(cols)].rename(columns=cols).dropna(subset=["close"])
+    out = out[(out["close"] > 0) & (out["volume"] > 0)]
+    if out.empty:
+        return None
+    out.index = pd.to_datetime(out.index).tz_localize(None).normalize()
+    out.index.name = "date"
+    return out
+
+
+def fetch_yahoo(start: str) -> None:
+    try:
+        import yfinance as yf
+    except ImportError:
+        sys.exit("沒有安裝 yfinance：請先執行  .venv-mcp\\Scripts\\pip install yfinance")
+    PRICES_YAHOO.mkdir(parents=True, exist_ok=True)
+    mk = universe_markets()
+    todo = [c for c in mk if not (PRICES_YAHOO / f"{c}.csv.gz").exists()]
+    print(f"[Yahoo] 股票池 {len(mk)} 檔，需抓 {len(todo)} 檔（每批 {YAHOO_CHUNK} 檔）", flush=True)
+    t0, missing = time.time(), []
+    for i in range(0, len(todo), YAHOO_CHUNK):
+        batch = todo[i:i + YAHOO_CHUNK]
+        tickers = {f"{c}.{'TW' if mk[c] == '上市' else 'TWO'}": c for c in batch}
+        raw = None
+        for attempt in range(3):
+            try:
+                raw = yf.download(list(tickers), start=start, auto_adjust=False, actions=False,
+                                  group_by="ticker", threads=True, progress=False)
+                break
+            except Exception as e:                       # noqa: BLE001
+                wait = 30 * (attempt + 1)
+                print(f"  第 {i // YAHOO_CHUNK + 1} 批失敗（{e}），{wait} 秒後重試", flush=True)
+                time.sleep(wait)
+        if raw is None:
+            print("  連續失敗，先停止；稍後重跑會從這裡續抓。", flush=True)
+            return
+        for t, c in tickers.items():
+            df = _yahoo_frame(raw, t)
+            if df is None:
+                missing.append(c)
+                (PRICES_YAHOO / f"{c}.csv.gz").write_bytes(b"")            # 標記：Yahoo 沒有資料
+            else:
+                df.reset_index().to_csv(PRICES_YAHOO / f"{c}.csv.gz", index=False)
+        print(f"  {min(i + YAHOO_CHUNK, len(todo))}/{len(todo)}，已花 {(time.time() - t0) / 60:.1f} 分鐘", flush=True)
+        time.sleep(2)
+    print(f"完成。Yahoo 沒有資料：{len(missing)} 檔{('（例：' + '、'.join(missing[:10]) + '）') if missing else ''}")
+    print("接著執行：python backtest_103.py compare（比對 FinMind 與 Yahoo）", flush=True)
+
+
+def adjusted_yahoo(df: pd.DataFrame) -> pd.DataFrame:
+    """Yahoo：用 Adj Close ÷ Close 的比值把開高低收一起做除息還原（分割已含在原始價裡）。"""
+    f = (df["adj_close"] / df["close"]).astype(float)
+    return pd.DataFrame({k: df[k].astype(float) * f for k in ("open", "high", "low", "close")}, index=df.index)
+
+
+def compare_sources(tol: float = 0.005) -> pd.DataFrame:
+    """比對 FinMind 與 Yahoo 重疊股票：逐日收盤價、成交量差異，以及「成交張數 ≥ 5000」判斷是否一致。"""
+    rows = []
+    for f in sorted(PRICES.glob("*.csv.gz")):
+        code = f.name[:4]
+        a, b = load_prices(code), load_prices(code, PRICES_YAHOO)
+        if a is None or b is None:
+            continue
+        j = a.join(b, how="inner", lsuffix="_fm", rsuffix="_yh")
+        if len(j) < 20:
+            continue
+        cdiff = (j["close_yh"] / j["close_fm"] - 1).abs()
+        vr = j["volume_yh"] / j["volume_fm"]
+        lots_fm, lots_yh = j["volume_fm"] / 1000 >= 5000, j["volume_yh"] / 1000 >= 5000
+        rows.append({
+            "代碼": code, "FinMind天數": len(a), "Yahoo天數": len(b), "重疊天數": len(j),
+            "Yahoo缺的天數": int(len(a.index.difference(b.index))),
+            "收盤差>0.5%的天數比例(%)": round(float((cdiff > tol).mean() * 100), 2),
+            "成交量比(中位數)": round(float(vr.median()), 3),
+            "成交量差>5%的天數比例(%)": round(float(((vr - 1).abs() > 0.05).mean() * 100), 2),
+            "張數≥5000判斷不一致天數": int((lots_fm != lots_yh).sum()),
+        })
+    return pd.DataFrame(rows)
+
+
 def _events_for(code: str, split: pd.DataFrame, red: pd.DataFrame) -> pd.DataFrame:
     rows = []
     f = DIVS / f"{code}.csv"
@@ -295,24 +405,46 @@ def _stats(r: np.ndarray) -> dict:
             "最差(%)": round(float(r.min() * 100), 2), "最佳(%)": round(float(r.max() * 100), 2)}
 
 
-def run(start: str, end: str | None = None) -> dict:
+YAHOO_JUMP = 0.105      # 台股漲跌幅 10%：還原後單日漲跌超過這個值，視為 Yahoo 分割／除權資料錯誤
+TAINT_DAYS = 60         # 疑似錯誤日前後 60 個交易日內的訊號、基準報酬都剔除
+
+
+def yahoo_taint(adj_close: pd.Series, skip_first: int = 5, days: int = TAINT_DAYS) -> np.ndarray:
+    """回傳布林陣列：True＝該日前後 days 日內有不合理跳動（上市前 skip_first 日無漲跌幅限制，不算）。"""
+    r = adj_close.astype(float).pct_change().abs().to_numpy()
+    bad = np.zeros(len(r), bool)
+    bad[skip_first:] = r[skip_first:] > YAHOO_JUMP
+    out = np.zeros(len(r), bool)
+    for i in np.nonzero(bad)[0]:
+        out[max(0, i - days): i + days + 1] = True
+    return out
+
+
+def run(start: str, end: str | None = None, source: str = "finmind",
+        codes: set[str] | None = None, tag: str = "") -> dict:
     from local_screener import Screen103Params
     p = Screen103Params()
-    OUT.mkdir(parents=True, exist_ok=True)
+    folder = PRICES_YAHOO if source == "yahoo" else PRICES
+    out_dir = OUT / (source + tag)
+    out_dir.mkdir(parents=True, exist_ok=True)
     split = pd.read_csv(CACHE / "split.csv") if (CACHE / "split.csv").exists() else None
     red = pd.read_csv(CACHE / "reduction.csv") if (CACHE / "reduction.csv").exists() else None
     t_start, t_end = pd.Timestamp(start), pd.Timestamp(end) if end else pd.Timestamp.max
 
     trades, bench_parts, ablation_rows = [], [], []
-    n_stock = n_skip_limit = 0
-    for f in sorted(PRICES.glob("*.csv.gz")):
+    n_stock = n_skip_limit = n_taint = n_taint_stock = 0
+    for f in sorted(folder.glob("*.csv.gz")):
         code = f.name[:4]
-        raw = load_prices(code)
+        if codes is not None and code not in codes:
+            continue
+        raw = load_prices(code, folder)
         if raw is None or len(raw) < 130:
             continue
         n_stock += 1
         cond = conditions_103(raw, p)
-        adj = adjusted(raw, _events_for(code, split, red))
+        adj = adjusted_yahoo(raw) if source == "yahoo" else adjusted(raw, _events_for(code, split, red))
+        taint = yahoo_taint(raw["adj_close"]) if source == "yahoo" else np.zeros(len(raw), bool)
+        n_taint_stock += int(taint.any())
         ao, ac = adj["open"].to_numpy(), adj["close"].to_numpy()
         rc, ro = raw["close"].to_numpy(), raw["open"].to_numpy()
         dates = raw.index
@@ -324,6 +456,7 @@ def run(start: str, end: str | None = None) -> dict:
             ex = ent + H - 1
             ok = ex < len(ac)
             fwd[ent[ok] - 1] = ac[ex[ok]] / ao[ent[ok]] - 1 - COST
+            fwd[taint] = np.nan
             b[H] = fwd
         bench_parts.append(pd.DataFrame({f"b{H}": b[H] for H in b}, index=dates))
         # 條件拆解：拿掉某一條件時的訊號
@@ -333,7 +466,7 @@ def run(start: str, end: str | None = None) -> dict:
             for j, k in enumerate(COND_KEYS):
                 if k != drop:
                     mask &= cm[:, j]
-            for t in np.nonzero(mask)[0]:
+            for t in np.nonzero(mask & ~taint)[0]:
                 if not (t_start <= dates[t] <= t_end) or t + 1 >= len(dates):
                     continue
                 if ro[t + 1] >= rc[t] * LIMIT_UP_OPEN:
@@ -344,6 +477,9 @@ def run(start: str, end: str | None = None) -> dict:
         # 正式交易
         for t in np.nonzero(cond["signal"].to_numpy())[0]:
             if not (t_start <= dates[t] <= t_end) or t + 1 >= len(dates):
+                continue
+            if taint[t]:
+                n_taint += 1
                 continue
             if ro[t + 1] >= rc[t] * LIMIT_UP_OPEN:
                 n_skip_limit += 1
@@ -368,12 +504,13 @@ def run(start: str, end: str | None = None) -> dict:
     T = pd.DataFrame(trades)
     B = pd.concat(bench_parts).groupby(level=0).mean()               # 每個訊號日：全市場等權重
     B = B[(B.index >= t_start) & (B.index <= t_end)]
-    T.to_csv(OUT / "trades.csv", index=False, encoding="utf-8-sig")
-    summary = {"期間": [start, end or str(B.index.max().date())], "股票池": n_stock,
-               "訊號數": int(len(T) + n_skip_limit), "開盤漲停買不到": n_skip_limit, "可交易筆數": int(len(T)),
+    T.to_csv(out_dir / "trades.csv", index=False, encoding="utf-8-sig")
+    summary = {"資料來源": source, "期間": [start, end or str(B.index.max().date())], "股票池": n_stock,
+               "訊號數": int(len(T) + n_skip_limit + n_taint), "開盤漲停買不到": n_skip_limit,
+               "資料疑似錯誤剔除": n_taint, "有疑似錯誤的股票數": n_taint_stock, "可交易筆數": int(len(T)),
                "成本": "來回 0.585%", "params": asdict(p)}
     if T.empty:
-        json.dump(summary, open(OUT / "summary.json", "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+        json.dump(summary, open(out_dir / "summary.json", "w", encoding="utf-8"), ensure_ascii=False, indent=1)
         return summary
     T["訊號日"] = pd.to_datetime(T["訊號日"])
     bmap = B.reindex(T["訊號日"])
@@ -419,7 +556,7 @@ def run(start: str, end: str | None = None) -> dict:
     summary["條件拆解(持有10日)"] = abl
     # 投組模擬：每筆訊號等權重、同時持有不限檔數；沒有部位的日子報酬 0
     summary["投組模擬"] = {name: portfolio(T, name) for name in ("持有10日", "停損8%＋持有20日")}
-    json.dump(summary, open(OUT / "summary.json", "w", encoding="utf-8"), ensure_ascii=False, indent=1, default=str)
+    json.dump(summary, open(out_dir / "summary.json", "w", encoding="utf-8"), ensure_ascii=False, indent=1, default=str)
     return summary
 
 
@@ -454,16 +591,29 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     f = sub.add_parser("fetch", help="抓日線（需網路）")
     f.add_argument("--start", default="2018-06-01")
+    f.add_argument("--source", choices=["finmind", "yahoo"], default="finmind")
+    sub.add_parser("compare", help="比對 FinMind 與 Yahoo 重疊股票的資料差異（離線）")
     r = sub.add_parser("run", help="離線回測")
     r.add_argument("--start", default="2019-01-01")
     r.add_argument("--end", default=None)
+    r.add_argument("--source", choices=["finmind", "yahoo"], default="finmind")
+    r.add_argument("--overlap", action="store_true", help="只跑 FinMind 也有抓到的股票（用來比對兩個來源的回測結果）")
     a = ap.parse_args()
     if a.cmd == "fetch":
-        fetch_all(a.start)
+        fetch_yahoo(a.start) if a.source == "yahoo" else fetch_all(a.start)
+    elif a.cmd == "compare":
+        df = compare_sources()
+        OUT.mkdir(parents=True, exist_ok=True)
+        df.to_csv(OUT / "compare_sources.csv", index=False, encoding="utf-8-sig")
+        print(f"重疊 {len(df)} 檔；結果：{OUT / 'compare_sources.csv'}")
+        if len(df):
+            print(df.describe().round(3).to_string())
     else:
-        s = run(a.start, a.end)
-        print(json.dumps({k: s[k] for k in ("期間", "股票池", "訊號數", "可交易筆數")}, ensure_ascii=False))
-        print(f"結果：{OUT}")
+        codes = {f.name[:4] for f in PRICES.glob("*.csv.gz") if f.stat().st_size > 10} if a.overlap else None
+        tag = "_overlap" if a.overlap else ""
+        s = run(a.start, a.end, a.source, codes=codes, tag=tag)
+        print(json.dumps({k: s[k] for k in ("資料來源", "期間", "股票池", "訊號數", "可交易筆數")}, ensure_ascii=False))
+        print(f"結果：{OUT / (a.source + tag)}")
 
 
 if __name__ == "__main__":

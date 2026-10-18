@@ -48,3 +48,57 @@ def test_adjusted_prices():
                         "close": [100, 100, 97, 98], "volume": 1}, index=idx)
     adj = bt.adjusted(raw, pd.DataFrame({"date": [idx[2]], "factor": [0.97]}))
     assert adj["close"].tolist() == pytest.approx([97, 97, 97, 98])
+
+
+def _yahoo_raw():
+    """模擬 yf.download(group_by='ticker') 的 MultiIndex 結果（2 檔，其中 9999.TW 全是空值）。"""
+    idx = pd.DatetimeIndex(["2026-07-08", "2026-07-09", "2026-07-10"], name="Date")
+    cols = ["Open", "High", "Low", "Close", "Adj Close", "Volume"]
+    a = pd.DataFrame([[810, 820, 800, 810, 806.08, 1e6], [806, 830, 800, 820, 820, 2e6],
+                      [820, 825, 815, 822, 822, 1.5e6]], index=idx, columns=cols)
+    b = pd.DataFrame(np.nan, index=idx, columns=cols)
+    return pd.concat({"3167.TWO": a, "9999.TW": b}, axis=1)
+
+
+def test_yahoo_frame_and_adjust():
+    raw = _yahoo_raw()
+    df = bt._yahoo_frame(raw, "3167.TWO")
+    assert list(df.columns) == ["open", "high", "low", "close", "adj_close", "volume"] and len(df) == 3
+    assert bt._yahoo_frame(raw, "9999.TW") is None            # 全空值 → 視為沒有資料
+    assert bt._yahoo_frame(raw, "1234.TW") is None            # 不在結果裡
+    adj = bt.adjusted_yahoo(df)
+    assert adj["close"].iloc[0] == pytest.approx(806.08)      # 除息前一天被調整
+    assert adj["open"].iloc[0] == pytest.approx(810 * 806.08 / 810)
+    assert adj["close"].iloc[-1] == 822                        # 最新價格不變
+
+
+def test_compare_sources(tmp_path, monkeypatch):
+    fm, yh = tmp_path / "fm", tmp_path / "yh"
+    fm.mkdir(); yh.mkdir()
+    monkeypatch.setattr(bt, "PRICES", fm)
+    monkeypatch.setattr(bt, "PRICES_YAHOO", yh)
+    idx = pd.bdate_range("2026-01-05", periods=30)
+    base = pd.DataFrame({"date": idx, "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0,
+                         "volume": 6_000_000.0})
+    base.to_csv(fm / "2330.csv.gz", index=False)
+    y = base.copy(); y["adj_close"] = 100.0
+    y.loc[3, "close"] = 103.0                                   # 一天收盤差 3%
+    y.loc[5, "volume"] = 4_000_000.0                            # 一天成交量跨過 5000 張門檻
+    y.drop(index=[7]).to_csv(yh / "2330.csv.gz", index=False)   # Yahoo 少一天
+    r = bt.compare_sources().iloc[0]
+    assert r["重疊天數"] == 29 and r["Yahoo缺的天數"] == 1
+    assert r["收盤差>0.5%的天數比例(%)"] == pytest.approx(100 / 29, abs=0.01)
+    assert r["張數≥5000判斷不一致天數"] == 1
+
+def test_yahoo_taint_marks_window_around_bad_jump():
+    import numpy as np
+    import pandas as pd
+    from backtest_103 import yahoo_taint
+    px = pd.Series(np.full(300, 100.0))
+    px.iloc[2] = 150.0                      # 上市初期（前 5 日）不算
+    px.iloc[3:] = 100.0
+    px.iloc[150:] = 75.0                    # 單日 -25%：超過漲跌幅限制
+    t = yahoo_taint(px, days=60)
+    assert not t[:89].any()
+    assert t[90:211].all()
+    assert not t[211:].any()
