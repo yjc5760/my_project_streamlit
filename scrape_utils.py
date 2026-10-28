@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import functools
+import inspect
 import hashlib
 import json
 import os
@@ -163,11 +164,17 @@ def disk_memo(namespace: str, ttl_sec: int):
     程式重啟後仍有效；讀寫失敗時直接重抓，不影響主流程。設環境變數 DISABLE_DISK_MEMO=1 可關閉。
     """
     def deco(fn):
+        sig = inspect.signature(fn)
+
         @functools.wraps(fn)
-        def wrapper(*args):
+        def wrapper(*args, **kwargs):
             if os.getenv("DISABLE_DISK_MEMO"):
-                return fn(*args)
-            key = hashlib.md5(repr(args).encode()).hexdigest()[:16]
+                return fn(*args, **kwargs)
+            # 把位置／關鍵字參數一律綁定成完整參數（含預設值），
+            # 讓 f(x, 3)、f(x, years=3)、f(x) 共用同一個快取鍵
+            bound = sig.bind(*args, **kwargs)
+            bound.apply_defaults()
+            key = hashlib.md5(repr(tuple(bound.arguments.items())).encode()).hexdigest()[:16]
             path = MEMO_DIR / namespace / f"{key}.pkl"
             try:
                 if path.exists() and time.time() - path.stat().st_mtime < ttl_sec:
@@ -175,7 +182,7 @@ def disk_memo(namespace: str, ttl_sec: int):
                         return pickle.load(f)
             except Exception as e:                  # noqa: BLE001
                 print(f"[memo] 讀取 {namespace}/{key} 失敗，改為重抓：{e}")
-            result = fn(*args)
+            result = fn(*args, **kwargs)
             try:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 tmp = path.with_suffix(".tmp")

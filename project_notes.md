@@ -32,3 +32,17 @@
 
 ### 踩坑
 - 參數化過程中，需確保 Streamlit session state 在切換選單時能正確保留或同步設定，避免刷新流失設定。
+
+
+## 2026-10-29 收工
+
+### 完成事項
+1. 優化 `scrape_utils.py` 之 `disk_memo` 裝飾器：支援關鍵字參數 (`**kwargs`)，並使用 `inspect.signature` 自動綁定與補全預設引數，讓 `f(code)`、`f(code, 3)` 與 `f(code, years=3)` 等呼叫形式共用同一快取鍵，避免重複抓取。
+2. 於 `tests/test_caching.py` 補齊 `disk_memo` 針對關鍵字參數與預設值快取命中的單元測試。
+
+### 下一步
+- 持續觀察各爬蟲/分析邏輯使用 `disk_memo` 之命中率與快取效益。
+- 檢視是否有其他模組呼叫帶有 kwargs 需要磁碟快取的場景。
+
+### 踩坑
+- 無。使用標準函式庫 `inspect.signature` 即可純粹處理參數標準化，不增加額外外部依賴。

@@ -89,6 +89,23 @@ def test_disk_memo(tmp_path, monkeypatch, clock):
     assert len(list((tmp_path / "t").glob("*.pkl"))) == 1      # 失敗不寫檔
 
 
+def test_disk_memo_kwargs_and_defaults(tmp_path, monkeypatch):
+    monkeypatch.delenv("DISABLE_DISK_MEMO", raising=False)
+    monkeypatch.setattr(su, "MEMO_DIR", tmp_path)
+    calls = []
+
+    @su.disk_memo("kwargs_t", 100)
+    def f(code, years=3, mode="full"):
+        calls.append((code, years, mode))
+        return 1
+
+    f("2330")
+    f("2330", 3)
+    f("2330", years=3)
+    f("2330", mode="full", years=3)
+    assert calls == [("2330", 3, "full")]
+
+
 def test_disk_memo_disabled(tmp_path, monkeypatch):
     monkeypatch.setattr(su, "MEMO_DIR", tmp_path)              # conftest 已設 DISABLE_DISK_MEMO
     calls = []
