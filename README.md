@@ -58,7 +58,7 @@
 
 - **KD 指標**：採台灣慣用的遞迴式 KD（9 期，與 Goodinfo 相同），程式在 `indicators.py`
 - **失敗不快取**：任何抓取失敗都不會被快取，重新按一次即可重試
-- **上次成功結果**：資料源暫時故障時，改顯示上次成功的結果並標註時間（存於 `.cache/last_good/`；Streamlit Cloud 重新部署後會清空）
+- **上次成功結果**：資料源暫時故障時，改顯示上次成功的結果並標註時間（存於 `.cache/last_good/`）。Streamlit Cloud 重新部署後本機檔案會清空，可選用 GitHub Gist 備份，見下方「上次成功結果的雲端備份」
 - **錯誤分類**：爬蟲失敗時會標示「連線問題／被網站阻擋／網頁改版／沒有資料」
 
 ---
@@ -67,7 +67,8 @@
 
 | 模組 | 功能 |
 |---|---|
-| `streamlit_app.py` | 主程式：UI、快取、上次成功結果 |
+| `streamlit_app.py` | 進入點：側邊欄按鈕、功能分派（約 100 行） |
+| `views/` | 各功能畫面：`common.py`（快取包裝、上次成功結果、K/D/I 數字欄位、個股圖元件）、`sidebar.py`（篩選參數）、`concentration.py`、`screen103.py`、`revenue.py`、`quality.py`、`ranking.py`、`single_stock.py` |
 | `services.py` | 選股流程共用邏輯（篩選規則、批次分析、上次成功結果）；Streamlit 與 MCP 共用 |
 | `mcp_server.py` | MCP Server：把選股與個股分析開放給 Antigravity 等 AI 工具 |
 | `local_screener.py` | 我的選股103（粗篩＋細篩），可獨立執行；細篩日線會保留給後續算指標、畫圖 |
@@ -79,7 +80,8 @@
 | `stock_information_plot.py` | 月營收趨勢圖、大戶持股變化圖 |
 | `concentration_1day.py` | 籌碼集中度爬蟲與篩選 |
 | `yahoo_scraper.py` | Yahoo 漲幅排行爬蟲（含備援解析）與盤中預估量因子（非交易日為 1） |
-| `scrape_utils.py` | 爬蟲錯誤分類、上次成功結果存取 |
+| `scrape_utils.py` | 爬蟲錯誤分類、上次成功結果存取（含選用的 Gist 遠端備份） |
+| `output_retention.py` | `mcp_output/` 自動清理規則（MCP Server 啟動時與每次存檔後執行） |
 | `tests/` | pytest 單元測試（不連網）：`pip install -r requirements-dev.txt` 後執行 `pytest` |
 
 ---
@@ -104,6 +106,24 @@ FINMIND_API_TOKEN = "你的 FinMind token"
 ```
 
 沒有 token 也能執行，但 FinMind 匿名存取有請求上限，選股103 的細篩與個股圖表可能失敗。
+
+### 上次成功結果的雲端備份（選用）
+
+Streamlit Cloud 重新部署或休眠喚醒後，`.cache/last_good/` 會被清空，資料源故障時就沒有上次結果可顯示。
+設定以下兩個 Secrets 後，每次抓取成功會在背景備份一份到你自己的私人 GitHub Gist；本機沒有存檔時才會去讀。
+
+1. 到 <https://gist.github.com> 建立一個 **Secret gist**（內容隨意，例如檔名 `README.md`、內容 `lkg`），網址最後那串就是 Gist ID。
+2. 到 GitHub Settings → Developer settings → Personal access tokens（classic）建立 token，**只勾 `gist`**。
+3. 在 Streamlit Cloud 的 Secrets 加入：
+
+```toml
+LKG_GIST_ID = "你的 Gist ID"
+LKG_GITHUB_TOKEN = "ghp_xxx"
+```
+
+- 沒設定時行為和以前完全一樣。
+- 資料沒變就不重傳；上傳在背景執行，不影響畫面速度。
+- 每份備份以 token 做 HMAC 簽章，讀取時驗證，簽章不符（token 換過或內容被改）就當作沒有備份。
 
 ---
 
@@ -153,6 +173,17 @@ FinMind token 會自動讀取 `.streamlit/secrets.toml`；也可以在設定檔�
 注意：
 - 不要把 `mcp` 加進 `requirements.txt`。
 - 共用模組裡的 `print()` 已在 `mcp_server.py` 導向 stderr，不會干擾 MCP 協定。
+
+### `mcp_output/` 自動清理
+
+MCP Server 啟動時、以及每次存圖或下載法說會簡報後，會依 `output_retention.py` 的規則清理：
+
+- 個股圖表 HTML：同一檔、同一種圖只留最新一份；超過 30 天的刪除（環境變數 `MCP_OUTPUT_KEEP_DAYS` 可調，`0`＝不依天數刪）
+- 法說會 PDF：不設期限，只刪同一份簡報重複下載的副本
+- 除錯用 `_mops_*.html`：7 天
+- `backtest_103/`、`plotly.min.js` 等其他檔案不動
+
+手動預覽會刪哪些：`.venv-mcp\Scripts\python output_retention.py --dry-run`
 
 ## 資料來源
 

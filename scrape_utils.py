@@ -93,21 +93,24 @@ def lkg_key(name: str, params: dict | None = None) -> str:
 
 
 def lkg_save(key: str, data) -> None:
+    obj = {"saved_at": datetime.now(ZoneInfo("Asia/Taipei")), "data": data}
     try:
         LKG_DIR.mkdir(parents=True, exist_ok=True)
         tmp = LKG_DIR / f"{key}.pkl.tmp"
         with open(tmp, "wb") as f:
-            pickle.dump({"saved_at": datetime.now(ZoneInfo("Asia/Taipei")), "data": data}, f)
+            pickle.dump(obj, f)
         tmp.replace(LKG_DIR / f"{key}.pkl")
     except Exception as e:                          # noqa: BLE001  存檔失敗不影響主流程
         print(f"[lkg] 無法儲存 {key}: {e}")
+    _remote_save(key, obj)
 
 
 def lkg_load(key: str):
-    """回傳 (data, saved_at)；沒有存檔時回傳 None。"""
+    """回傳 (data, saved_at)；沒有存檔時回傳 None。本機沒有時（例如雲端重新部署後）改讀遠端備份。"""
     path = LKG_DIR / f"{key}.pkl"
     if not path.exists():
-        return None
+        obj = _remote_load(key)
+        return (obj["data"], obj["saved_at"]) if obj else None
     try:
         with open(path, "rb") as f:
             obj = pickle.load(f)
@@ -115,6 +118,121 @@ def lkg_load(key: str):
     except Exception as e:                          # noqa: BLE001
         print(f"[lkg] 無法讀取 {key}: {e}")
         return None
+
+
+# ---------------------------------------------------------------------------
+# 上次成功結果的遠端備份（選用）：存到使用者自己的私人 GitHub Gist，
+# 讓 Streamlit Cloud 重新部署、休眠喚醒後仍有上次結果可顯示。
+#   LKG_GIST_ID       Gist 的 ID（網址最後那串）
+#   LKG_GITHUB_TOKEN  只勾 gist 權限的 GitHub token
+# 兩個都設定才啟用；沒設定時行為和以前完全一樣。
+# - 上傳在背景執行緒，不拖慢畫面；資料沒變就不重傳。
+# - 只有本機沒有存檔時才讀遠端，讀回來後存一份到本機。
+# - 每份資料以 token 做 HMAC-SHA256 簽章，讀取時驗證，簽章不符一律丟棄（不 unpickle 來路不明的資料）。
+# ---------------------------------------------------------------------------
+_GIST_API = "https://api.github.com/gists/"
+_REMOTE_PREFIX = "lkg1"
+_remote_sent: dict[str, str] = {}                  # key → 最後一次上傳的資料雜湊
+_remote_lock = threading.Lock()
+
+
+def _remote_cfg() -> tuple[str, str] | None:
+    gist, token = os.getenv("LKG_GIST_ID", "").strip(), os.getenv("LKG_GITHUB_TOKEN", "").strip()
+    return (gist, token) if gist and token else None
+
+
+def _gist_headers(token: str) -> dict:
+    return {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28"}
+
+
+def _encode_remote(obj, token: str) -> str:
+    import base64, hmac, zlib
+    blob = zlib.compress(pickle.dumps(obj), 6)
+    sig = hmac.new(token.encode(), blob, hashlib.sha256).hexdigest()
+    return f"{_REMOTE_PREFIX}:{sig}:{base64.b64encode(blob).decode()}"
+
+
+def _decode_remote(text: str, token: str):
+    """驗證簽章後還原；格式或簽章不符時 raise ValueError。"""
+    import base64, hmac, zlib
+    try:
+        prefix, sig, b64 = text.strip().split(":", 2)
+        blob = base64.b64decode(b64, validate=True)
+    except Exception as e:                          # noqa: BLE001
+        raise ValueError(f"格式不符：{e}") from e
+    if prefix != _REMOTE_PREFIX:
+        raise ValueError("格式版本不符")
+    expect = hmac.new(token.encode(), blob, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expect, sig):
+        raise ValueError("簽章不符（token 已更換或內容遭修改）")
+    return pickle.loads(zlib.decompress(blob))
+
+
+def _remote_upload(key: str, content: str, digest: str, cfg: tuple[str, str]) -> None:
+    gist, token = cfg
+    try:
+        r = requests.patch(_GIST_API + gist, headers=_gist_headers(token), timeout=20,
+                           json={"files": {f"{key}.lkg": {"content": content}}})
+        if r.status_code >= 400:
+            raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
+        with _remote_lock:
+            _remote_sent[key] = digest
+    except Exception as e:                          # noqa: BLE001  備份失敗不影響主流程
+        print(f"[lkg] 遠端備份 {key} 失敗：{e}")
+
+
+def _remote_save(key: str, obj, background: bool = True) -> None:
+    cfg = _remote_cfg()
+    if not cfg:
+        return
+    try:
+        digest = hashlib.sha256(pickle.dumps(obj["data"])).hexdigest()
+        with _remote_lock:
+            if _remote_sent.get(key) == digest:     # 資料沒變（例如同一份結果畫面重整），不重傳
+                return
+        content = _encode_remote(obj, cfg[1])
+    except Exception as e:                          # noqa: BLE001
+        print(f"[lkg] 遠端備份 {key} 失敗：{e}")
+        return
+    if background:
+        threading.Thread(target=_remote_upload, args=(key, content, digest, cfg), daemon=True).start()
+    else:
+        _remote_upload(key, content, digest, cfg)
+
+
+def _remote_load(key: str):
+    cfg = _remote_cfg()
+    if not cfg:
+        return None
+    gist, token = cfg
+    try:
+        r = requests.get(_GIST_API + gist, headers=_gist_headers(token), timeout=15)
+        if r.status_code >= 400:
+            raise RuntimeError(f"HTTP {r.status_code}")
+        f = (r.json().get("files") or {}).get(f"{key}.lkg")
+        if not f:
+            return None
+        text = f.get("content") or ""
+        if f.get("truncated"):                      # 超過 1MB 時 API 只回部分內容，改抓原始檔
+            raw = requests.get(f["raw_url"], headers=_gist_headers(token), timeout=30)
+            raw.raise_for_status()
+            text = raw.text
+        obj = _decode_remote(text, token)
+    except Exception as e:                          # noqa: BLE001
+        print(f"[lkg] 讀取遠端備份 {key} 失敗：{e}")
+        return None
+    try:                                            # 讀回來存一份到本機，下次不用再連網
+        LKG_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = LKG_DIR / f"{key}.pkl.tmp"
+        with open(tmp, "wb") as fh:
+            pickle.dump(obj, fh)
+        tmp.replace(LKG_DIR / f"{key}.pkl")
+    except Exception:                               # noqa: BLE001
+        pass
+    with _remote_lock:
+        _remote_sent[key] = hashlib.sha256(pickle.dumps(obj["data"])).hexdigest()
+    return obj
 
 
 # ---------------------------------------------------------------------------

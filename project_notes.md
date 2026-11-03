@@ -46,3 +46,20 @@
 
 ### 踩坑
 - 無。使用標準函式庫 `inspect.signature` 即可純粹處理參數標準化，不增加額外外部依賴。
+
+
+## 2026-11-03 收工
+
+### 完成事項
+1. **Streamlit UI 模組化拆分**：將龐大的 `streamlit_app.py` 拆解重構，把畫面呈現、側邊欄參數與各選股視圖模組化移入 `views/`（`common.py`、`sidebar.py`、`concentration.py`、`screen103.py`、`revenue.py`、`quality.py`、`ranking.py`、`single_stock.py`），使進入點維持約 100 行清晰路由。
+2. **上次成功結果（LKG）雲端備份**：於 `scrape_utils.py` 實作選用的 GitHub Gist 遠端備份與 HMAC 簽章驗證機制，並透過背景線程非同步上傳，解決 Streamlit Cloud 重新部署後本地快取遺失的問題；新增 `tests/test_lkg_remote.py` 測試。
+3. **`mcp_output/` 自動清理策略**：新增 `output_retention.py`，支援 HTML 個股圖表（同檔/同種類留最新一份、預設 >30 天清理）、法說會 PDF 重複副本清理與除錯暫存檔清理，並整合至 `mcp_server.py` 啟動與存檔觸發；新增 `tests/test_output_retention.py` 測試。
+4. **文件與測試完善**：更新 `README.md` 專案架構、Gist 備份設定與 MCP 清理說明；全量 108 項單元測試皆順利通過。
+
+### 下一步
+- 觀察 Streamlit Cloud 與 GitHub Gist 整合之實際運作情況。
+- 觀察 MCP Server 長期運作下 `mcp_output/` 檔案清理表現。
+
+### 踩坑
+- 無。拆分 views 模組時維持 session state 與函式介面一致性，確保既有行為無縫過渡。
+

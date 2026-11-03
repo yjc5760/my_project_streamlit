@@ -63,6 +63,7 @@ from stock_information_plot import (plot_stock_revenue_trend, plot_stock_major_s
                                     get_stock_code)
 from concentration_1day import fetch_stock_concentration_data
 from scrape_utils import lkg_key, memoize_ttl
+from output_retention import prune_outputs
 
 mcp = FastMCP(
     "tw-stock-analyzer",
@@ -383,6 +384,7 @@ def _single(stock: str, save_charts: bool) -> dict:
         out["chart_files"] = charts
         out["open_hint"] = "在檔案總管雙擊 HTML 即可用瀏覽器開啟；或在 cmd 執行 start \"\" \"<檔案路徑>\""
         out["chart_errors"] = chart_errors
+        prune_outputs(OUT_DIR)          # 同一檔同一種圖只留最新一份、超過保存天數的刪除
     return out
 
 
@@ -549,9 +551,11 @@ def _earnings(stock: str, n_download: int, years: int, extract_text: bool, debug
     if not code:
         raise ValueError(f"找不到股票「{stock}」，請輸入代碼（如 2330）或名稱（如 台積電）")
     info = twstock.codes.get(code)
-    return {"queried_at": _now(), "code": code, "name": info.name if info else code,
-            "source": "公開資訊觀測站 法人說明會一覽表（t100sb02_1）",
-            **get_materials(code, OUT_DIR, n_download, years, extract_text, debug, include_sessions)}
+    out = {"queried_at": _now(), "code": code, "name": info.name if info else code,
+           "source": "公開資訊觀測站 法人說明會一覽表（t100sb02_1）",
+           **get_materials(code, OUT_DIR, n_download, years, extract_text, debug, include_sessions)}
+    prune_outputs(OUT_DIR)              # 清掉重複下載的同一份簡報、過期的除錯檔
+    return out
 
 
 @mcp.tool()
@@ -584,6 +588,10 @@ async def earnings_call_materials(stock: str, n_download: int = 2, years: int = 
 def main() -> None:
     from io import TextIOWrapper
     from mcp.server.stdio import stdio_server
+
+    removed = prune_outputs(OUT_DIR)
+    if removed:
+        print(f"[retention] 已清理 mcp_output/ 舊檔 {len(removed)} 個", file=sys.stderr)
 
     async def _run():
         out = anyio.wrap_file(TextIOWrapper(_PROTOCOL_STDOUT.buffer, encoding="utf-8"))
