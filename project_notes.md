@@ -63,3 +63,29 @@
 ### 踩坑
 - 無。拆分 views 模組時維持 session state 與函式介面一致性，確保既有行為無縫過渡。
 
+
+## 2026-11-05 收工
+
+### 完成事項
+1. **券商風台股日K線模組 (`kline_chart.py`)**：
+   - 實作 Plotly 互動式日K線圖（紅漲綠跌K棒、20EMA/60EMA、分價量橫條、成交量副圖、區間最高/最低標註）。
+   - 分價量採用 `layer="below"` 背景矩形，避免覆蓋K棒，並以等寬價格階梯平均分配成交量。
+   - 整合 KD(9,3,3) 與 MACD(12,26,9) 技術指標副圖，並支援成交量漲跌上色（`vol_updown`）。
+   - 預設提供淺色白底風格（`theme="light"`），並保留暗色主題（`theme="dark"`）。
+   - 抓取邏輯串接 `finmind_client.price_history`，成交量自適應單位（股換算為張）。
+2. **Streamlit UI 整合**：
+   - 於 `views/single_stock.py` 新增「日K線」分頁，支援 3/6 個月區間切換、KD/MACD 副圖自選與成交量著色開關。
+   - 共用既有日線快取 `_cached_price_history`，不重複呼叫 FinMind API。
+3. **單元測試與交接文件**：
+   - 新增 `tests/test_kline_chart.py`（涵蓋分價量守恆、一字線、副圖指標結構與自適應單位等測試）。
+   - 更新 `HANDOFF.md` 記錄日K線實作細節與驗證數據（華邦電 2344）。
+
+### 下一步
+- 於本機或 Streamlit Cloud 環境目視確認「日K線」分頁互動體驗。
+- 評估是否將日K線圖表納入 MCP Server 輸出工具或加入週K/月K線支援。
+
+### 踩坑
+- Plotly 雙 X 軸在處理分價量長條時，預設 Bar 圖層會蓋住K棒；改以 `shapes` 矩形且設定 `layer="below"` 解決遮擋問題。
+- KD/MACD 技術指標若直接在裁切後的區間計算會因初始暖機不足失真；必須在完整歷史日線上暖機計算完畢後再切片。
+
+

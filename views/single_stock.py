@@ -1,12 +1,13 @@
-"""個股查詢：技術分析、月營收、大戶持股、季報指標。"""
+"""個股查詢：技術分析、日K線、月營收、大戶持股、季報指標。"""
 import pandas as pd
 import streamlit as st
 import twstock
 from plotly.subplots import make_subplots
 
+from kline_chart import make_kline_figure
 from stock_information_plot import get_stock_code
 from viz import SERIES, legend_top
-from views.common import (_fig_from_cache, cached_financial_snapshot, cached_plot_revenue,
+from views.common import (_cached_price_history, _fig_from_cache, cached_financial_snapshot, cached_plot_revenue,
                           cached_plot_shareholders, render_stock_chart)
 
 
@@ -22,9 +23,11 @@ def display_single_stock_analysis(stock_identifier: str):
         stock_name = stock_info.name if stock_info else stock_code
         st.subheader(f"{stock_name} ({stock_code})")
         
-        tab1, tab2, tab3, tab4 = st.tabs(["技術分析", "月營收趨勢", "大戶股權變化", "季報指標"])
+        tab1, tab_k, tab2, tab3, tab4 = st.tabs(["技術分析", "日K線", "月營收趨勢", "大戶股權變化", "季報指標"])
         with tab1:
             render_stock_chart(stock_code, stock_name, key=f"tech_{stock_code}")
+        with tab_k:
+            render_kline(stock_code, stock_name)
         with tab2:
             with st.spinner("正在生成月營收趨勢圖..."):
                 revenue_json, revenue_error = cached_plot_revenue(stock_code)
@@ -41,6 +44,26 @@ def display_single_stock_analysis(stock_identifier: str):
                     st.error(f"無法生成大戶股權圖: {shareholder_error}")
         with tab4:
             render_financial_snapshot(stock_code)
+
+
+def render_kline(stock_code: str, stock_name: str):
+    """券商風日K線：K棒＋20/60EMA＋分價量＋成交量（共用技術分析的日線快取，不另打 FinMind）。"""
+    c1, c2, c3 = st.columns([1, 1.4, 1])
+    months = c1.radio("區間", [3, 6], format_func=lambda m: f"{m} 個月", horizontal=True,
+                      key=f"kline_m_{stock_code}")
+    panels = c2.multiselect("副圖", ["KD", "MACD"], default=["KD", "MACD"], key=f"kline_p_{stock_code}")
+    updown = c3.toggle("成交量依漲跌上色", key=f"kline_vc_{stock_code}")
+    try:
+        with st.spinner("正在讀取日線（FinMind）..."):
+            df = _cached_price_history(stock_code)
+        fig = make_kline_figure(df, f"{stock_name} {stock_code}", months, vol_updown=updown,
+                                panels=[p.lower() for p in panels])
+    except Exception as e:                      # noqa: BLE001  AnalysisError／資料不足
+        st.error(f"無法生成日K線圖：{e}")
+        return
+    st.plotly_chart(fig, width="stretch", key=f"kline_{stock_code}")
+    st.caption("紅漲綠跌；藍線 20EMA、棕線 60EMA；灰色橫條為區間分價量（每根K棒的量平均分配到最高～最低價）；"
+               "成交量單位：張；KD(9,3,3) 虛線為 20／80；MACD(12,26,9) 柱為 DIF−MACD，紅正綠負")
 
 
 def _metric_delta(v, unit):
