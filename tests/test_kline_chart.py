@@ -2,7 +2,7 @@
 import numpy as np
 import pandas as pd
 
-from kline_chart import make_kline_figure, volume_profile
+from kline_chart import THEMES, make_kline_figure, volume_profile
 from conftest import make_ohlcv
 
 
@@ -38,7 +38,13 @@ def test_vol_updown_colors():
     df = make_ohlcv(200)
     fig = make_kline_figure(df, months=3, vol_updown=True)
     colors = set(fig.data[3].marker.color)
-    assert colors <= {"#e8343a", "#2fb34a"}
+    assert colors <= {THEMES["light"]["UP"], THEMES["light"]["DOWN"]}
+
+
+def test_themes():
+    df = make_ohlcv(200)
+    assert make_kline_figure(df).layout.plot_bgcolor == "#ffffff"          # 預設白底
+    assert make_kline_figure(df, theme="dark").layout.plot_bgcolor == THEMES["dark"]["BG"]
 
 
 def test_kd_macd_panels():

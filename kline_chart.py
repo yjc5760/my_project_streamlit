@@ -1,5 +1,5 @@
 """
-台股日K線圖（仿券商 App 暗色主題）：K棒 + 20/60 EMA + 分價量(Volume Profile) + 成交量
+台股日K線圖（仿券商 App；預設白底，可選暗色）：K棒 + 20/60 EMA + 分價量(Volume Profile) + 成交量
 ＋選用副圖 KD(9,3,3)、MACD(12,26,9)。
 紅漲綠跌；區間最高／最低標註；標題列顯示開高低收、漲跌幅、EMA、成交量。
 
@@ -25,21 +25,14 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 # ---- 配色（台股：紅漲綠跌）----
-BG = "#2b2b2b"
-GRID = "#3a3a3a"
-TXT = "#d0d0d0"
-UP = "#e8343a"
-DOWN = "#2fb34a"
-EMA20_C = "#3b5bdb"
-EMA60_C = "#c9a089"
-VP_C = "rgba(140,140,140,0.35)"
-VOL_C = "#2f8fe0"
-K_C = "#f0b429"      # KD：K 琥珀
-D_C = "#4dabf7"      #     D 淺藍
-DIF_C = "#4dabf7"    # MACD：DIF 淺藍
-DEA_C = "#f0b429"    #       訊號線 琥珀
-REF_C = "#6a6a6a"    # 20/80、零軸參考線
-
+THEMES = {
+    "light": dict(BG="#ffffff", GRID="#ececec", TXT="#333333", UP="#e03131", DOWN="#1f9d3f",
+                  EMA20_C="#3b5bdb", EMA60_C="#b0784f", VP_C="rgba(120,120,120,0.16)", VOL_C="#2f8fe0",
+                  K_C="#e08e00", D_C="#1c7ed6", DIF_C="#1c7ed6", DEA_C="#e08e00", REF_C="#adb5bd"),
+    "dark": dict(BG="#2b2b2b", GRID="#3a3a3a", TXT="#d0d0d0", UP="#e8343a", DOWN="#2fb34a",
+                 EMA20_C="#3b5bdb", EMA60_C="#c9a089", VP_C="rgba(140,140,140,0.35)", VOL_C="#2f8fe0",
+                 K_C="#f0b429", D_C="#4dabf7", DIF_C="#4dabf7", DEA_C="#f0b429", REF_C="#6a6a6a"),
+}
 WARMUP_DAYS = 200   # 多抓的日曆天數，讓 60EMA 在顯示區間開頭已收斂
 
 
@@ -94,12 +87,16 @@ def _panel_label(fig: go.Figure, row: int, parts: list[tuple[str, str]]) -> None
 
 def make_kline_figure(df: pd.DataFrame, title: str = "", months: int = 3,
                       vol_updown: bool = False, panels: tuple[str, ...] | list[str] = (),
-                      height: int | None = None) -> go.Figure:
+                      height: int | None = None, theme: str = "light") -> go.Figure:
     """
     df：open/high/low/close/volume(股)。指標用全部資料計算，只顯示最近 months 個月。
     panels：成交量下方要加的副圖，可含 "kd"、"macd"（依給定順序）。
     height：預設主圖＋量 640px，每多一個副圖加 150px。
+    theme："light"（白底，預設）或 "dark"（券商 App 暗色）。
     """
+    if theme not in THEMES:
+        raise ValueError(f"不支援的主題：{theme}")
+    pal = THEMES[theme]
     panels = [p.lower() for p in panels]
     bad = set(panels) - {"kd", "macd"}
     if bad:
@@ -118,7 +115,7 @@ def make_kline_figure(df: pd.DataFrame, title: str = "", months: int = 3,
     last = v.iloc[-1]
     prev = df["close"].iloc[-2]
     chg = last.close - prev
-    arrow, cc = ("▲", UP) if chg >= 0 else ("▼", DOWN)
+    arrow, cc = ("▲", pal['UP']) if chg >= 0 else ("▼", pal['DOWN'])
 
     n_sub = len(panels)
     if n_sub == 0:
@@ -137,71 +134,71 @@ def make_kline_figure(df: pd.DataFrame, title: str = "", months: int = 3,
     for p, vol, h in vp[["price", "volume", "h"]].itertuples(index=False):
         if vol <= 0:
             continue
-        fig.add_shape(type="rect", xref="paper", yref="y", layer="below", line_width=0, fillcolor=VP_C,
+        fig.add_shape(type="rect", xref="paper", yref="y", layer="below", line_width=0, fillcolor=pal['VP_C'],
                       x0=0, x1=0.8 * vol / vmax, y0=p - h * 0.4, y1=p + h * 0.4)
 
     fig.add_trace(go.Candlestick(x=x, open=v.open, high=v.high, low=v.low, close=v.close,
-                                 increasing=dict(line=dict(color=UP, width=1), fillcolor=UP),
-                                 decreasing=dict(line=dict(color=DOWN, width=1), fillcolor=DOWN),
+                                 increasing=dict(line=dict(color=pal['UP'], width=1), fillcolor=pal['UP']),
+                                 decreasing=dict(line=dict(color=pal['DOWN'], width=1), fillcolor=pal['DOWN']),
                                  name="日K", showlegend=False), row=1, col=1)
-    fig.add_trace(go.Scatter(x=x, y=v.ema20, line=dict(color=EMA20_C, width=1.4), name="20EMA",
+    fig.add_trace(go.Scatter(x=x, y=v.ema20, line=dict(color=pal['EMA20_C'], width=1.4), name="20EMA",
                              hovertemplate="%{y:.2f}"), row=1, col=1)
-    fig.add_trace(go.Scatter(x=x, y=v.ema60, line=dict(color=EMA60_C, width=1.4), name="60EMA",
+    fig.add_trace(go.Scatter(x=x, y=v.ema60, line=dict(color=pal['EMA60_C'], width=1.4), name="60EMA",
                              hovertemplate="%{y:.2f}"), row=1, col=1)
 
     if vol_updown:
-        vol_color = [UP if c >= o else DOWN for o, c in zip(v.open, v.close)]
+        vol_color = [pal['UP'] if c >= o else pal['DOWN'] for o, c in zip(v.open, v.close)]
     else:
-        vol_color = VOL_C
+        vol_color = pal['VOL_C']
     fig.add_trace(go.Bar(x=x, y=v.volume, marker_color=vol_color, name="量(張)", showlegend=False,
                          hovertemplate="%{y:,.0f} 張"), row=2, col=1)
 
     for i, panel in enumerate(panels):
         row = 3 + i
         if panel == "kd":
-            fig.add_trace(go.Scatter(x=x, y=v.k, line=dict(color=K_C, width=1.3), name="K",
+            fig.add_trace(go.Scatter(x=x, y=v.k, line=dict(color=pal['K_C'], width=1.3), name="K",
                                      hovertemplate="%{y:.2f}"), row=row, col=1)
-            fig.add_trace(go.Scatter(x=x, y=v.d, line=dict(color=D_C, width=1.3), name="D",
+            fig.add_trace(go.Scatter(x=x, y=v.d, line=dict(color=pal['D_C'], width=1.3), name="D",
                                      hovertemplate="%{y:.2f}"), row=row, col=1)
             for lv in (20, 80):
-                fig.add_hline(y=lv, line=dict(color=REF_C, width=1, dash="dot"), row=row, col=1)
+                fig.add_hline(y=lv, line=dict(color=pal['REF_C'], width=1, dash="dot"), row=row, col=1)
             fig.update_yaxes(range=[0, 100], tickvals=[20, 50, 80], row=row, col=1)
-            _panel_label(fig, row, [("KD(9)", TXT), (f"K {last.k:.2f}", K_C), (f"D {last.d:.2f}", D_C)])
+            _panel_label(fig, row, [("KD(9)", pal['TXT']), (f"K {last.k:.2f}", pal['K_C']), (f"D {last.d:.2f}", pal['D_C'])])
         else:
             fig.add_trace(go.Bar(x=x, y=v.osc, name="OSC", hovertemplate="%{y:.2f}",
-                                 marker_color=[UP if o >= 0 else DOWN for o in v.osc]), row=row, col=1)
-            fig.add_trace(go.Scatter(x=x, y=v.dif, line=dict(color=DIF_C, width=1.3), name="DIF",
+                                 marker_color=[pal['UP'] if o >= 0 else pal['DOWN'] for o in v.osc]), row=row, col=1)
+            fig.add_trace(go.Scatter(x=x, y=v.dif, line=dict(color=pal['DIF_C'], width=1.3), name="DIF",
                                      hovertemplate="%{y:.2f}"), row=row, col=1)
-            fig.add_trace(go.Scatter(x=x, y=v.dea, line=dict(color=DEA_C, width=1.3), name="MACD",
+            fig.add_trace(go.Scatter(x=x, y=v.dea, line=dict(color=pal['DEA_C'], width=1.3), name="MACD",
                                      hovertemplate="%{y:.2f}"), row=row, col=1)
-            _panel_label(fig, row, [("MACD(12,26,9)", TXT), (f"DIF {last.dif:.2f}", DIF_C),
-                                    (f"MACD {last.dea:.2f}", DEA_C),
-                                    (f"OSC {last.osc:.2f}", UP if last.osc >= 0 else DOWN)])
+            _panel_label(fig, row, [("MACD(12,26,9)", pal['TXT']), (f"DIF {last.dif:.2f}", pal['DIF_C']),
+                                    (f"MACD {last.dea:.2f}", pal['DEA_C']),
+                                    (f"OSC {last.osc:.2f}", pal['UP'] if last.osc >= 0 else pal['DOWN'])])
 
     # 區間最高／最低標註
     ih, il = v["high"].idxmax(), v["low"].idxmin()
     fig.add_annotation(x=ih.strftime("%m/%d"), y=v.high.max(), text=f"←{v.high.max():g}", xref="x", yref="y",
-                       showarrow=False, xanchor="left", yanchor="bottom", font=dict(color=UP, size=12))
+                       showarrow=False, xanchor="left", yanchor="bottom", font=dict(color=pal['UP'], size=12))
     fig.add_annotation(x=il.strftime("%m/%d"), y=v.low.min(), text=f"{v.low.min():g}→", xref="x", yref="y",
-                       showarrow=False, xanchor="right", yanchor="top", font=dict(color=DOWN, size=12))
+                       showarrow=False, xanchor="right", yanchor="top", font=dict(color=pal['DOWN'], size=12))
 
     head = (f"<b>{title}</b>  開{last.open:g} 高{last.high:g} 低{last.low:g} 收{last.close:g} "
             f"<span style='color:{cc}'>{arrow}{chg:+.2f} ({chg / prev * 100:+.2f}%)</span><br>"
-            f"<span style='color:{EMA20_C}'>20EMA {last.ema20:.2f}</span>   "
-            f"<span style='color:{EMA60_C}'>60EMA {last.ema60:.2f}</span>   "
-            f"<span style='color:{TXT}'>量 {last.volume:,.0f} 張</span>")
+            f"<span style='color:{pal['EMA20_C']}'>20EMA {last.ema20:.2f}</span>   "
+            f"<span style='color:{pal['EMA60_C']}'>60EMA {last.ema60:.2f}</span>   "
+            f"<span style='color:{pal['TXT']}'>量 {last.volume:,.0f} 張</span>")
 
-    common = dict(gridcolor=GRID, zeroline=False)
+    common = dict(gridcolor=pal['GRID'], zeroline=False)
     fig.update_xaxes(type="category", rangeslider_visible=False, nticks=6, **common)
     fig.update_yaxes(side="right", **common)
     fig.update_yaxes(showgrid=False, row=2, col=1)
     for i, panel in enumerate(panels):          # update_yaxes(**common) 會把 zeroline 關掉，MACD 再打開
         if panel == "macd":
-            fig.update_yaxes(zeroline=True, zerolinecolor=REF_C, row=3 + i, col=1)
+            fig.update_yaxes(zeroline=True, zerolinecolor=pal['REF_C'], row=3 + i, col=1)
     fig.update_layout(
-        title=dict(text=head, x=0.01, font=dict(size=14, color=TXT)),
-        paper_bgcolor=BG, plot_bgcolor=BG,
-        font=dict(color=TXT, family="Noto Sans TC, Microsoft JhengHei, sans-serif"),
+        title=dict(text=head, x=0.01, font=dict(size=14, color=pal['TXT'])),
+        paper_bgcolor=pal['BG'], plot_bgcolor=pal['BG'],
+        font=dict(color=pal['TXT'], family="Noto Sans TC, Microsoft JhengHei, sans-serif"),
         margin=dict(l=10, r=55, t=70, b=30), height=height, hovermode="x unified",
         showlegend=False, bargap=0.15,
     )
@@ -215,6 +212,7 @@ if __name__ == "__main__":
     ap.add_argument("--name", default="")
     ap.add_argument("--token", default=None, help="FinMind token（預設讀 FINMIND_API_TOKEN）")
     ap.add_argument("--vol-updown", action="store_true", help="成交量依漲跌上紅綠色")
+    ap.add_argument("--dark", action="store_true", help="暗色主題")
     ap.add_argument("--kd", action="store_true", help="加 KD 副圖")
     ap.add_argument("--macd", action="store_true", help="加 MACD 副圖")
     a = ap.parse_args()
@@ -222,7 +220,8 @@ if __name__ == "__main__":
         os.environ["FINMIND_API_TOKEN"] = a.token
     data = fetch_daily(a.stock_id, a.months)
     panels = [p for p, on in (("kd", a.kd), ("macd", a.macd)) if on]
-    f = make_kline_figure(data, f"{a.name} {a.stock_id}".strip(), a.months, a.vol_updown, panels)
+    f = make_kline_figure(data, f"{a.name} {a.stock_id}".strip(), a.months, a.vol_updown, panels,
+                          theme="dark" if a.dark else "light")
     out = f"{a.stock_id}_kline.html"
     f.write_html(out, include_plotlyjs="cdn")
     print("saved", out)
